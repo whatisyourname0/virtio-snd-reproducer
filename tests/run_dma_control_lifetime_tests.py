@@ -18,8 +18,9 @@ from pathlib import Path
 LAB = Path(__file__).resolve().parent
 DMA_HARNESS = LAB / "virtio_snd_dma_lifetime_harness.c"
 CTL_HARNESS = LAB / "virtio_snd_payload_lifetime_harness.c"
-BASELINE_DEFAULT = "HEAD~2"
-V1_CONTROL_REF = "HEAD"
+BASELINE_DEFAULT = "HEAD~3"
+V1_CONTROL_REF_DEFAULT = "HEAD~1"
+V2_CONTROL_REF_DEFAULT = "HEAD"
 
 DMA_FILES = (
     "sound/virtio/virtio_pcm_msg.c",
@@ -197,7 +198,8 @@ def compile_binary(cc: list[str], source: Path, binary: Path) -> None:
     subprocess.run(command, check=True)
 
 
-def run(binary: Path, *arguments: str, expect_uaf: bool = False) -> str:
+def run(binary: Path, *arguments: str, expect_uaf: bool = False,
+        expect_alignment_ubsan: bool = False) -> str:
     env = os.environ.copy()
     env.setdefault("ASAN_OPTIONS", "detect_leaks=0:halt_on_error=1")
     env.setdefault("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
@@ -210,6 +212,11 @@ def run(binary: Path, *arguments: str, expect_uaf: bool = False) -> str:
     if expect_uaf:
         if result.returncode == 0 or "heap-use-after-free" not in result.stdout:
             raise RuntimeError(f"expected an ASan UAF from {' '.join(arguments)}")
+    elif expect_alignment_ubsan:
+        if result.returncode == 0 or "misaligned address" not in result.stdout:
+            raise RuntimeError(
+                f"expected a UBSan alignment failure from {' '.join(arguments)}"
+            )
     elif result.returncode or "RESULT PASS" not in result.stdout:
         raise RuntimeError(f"lifetime contract failed in {' '.join(arguments)}")
     return result.stdout
@@ -221,7 +228,13 @@ def main() -> int:
                         required=True, help="patched Linux source Git worktree")
     parser.add_argument("--baseline-ref", "--baseline", dest="baseline_ref",
                         default=BASELINE_DEFAULT,
-                        help="Git commit/ref before the PCM/control lifetime patches")
+                        help="Git ref after patches 1-3 and before patches 4-5")
+    parser.add_argument("--v1-control-baseline-ref",
+                        default=V1_CONTROL_REF_DEFAULT,
+                        help="source ref after the signed v1 patch series")
+    parser.add_argument("--v2-control-baseline-ref",
+                        default=V2_CONTROL_REF_DEFAULT,
+                        help="source ref after the committed v2 overlay")
     parser.add_argument("--manifest-out", type=Path,
                         help="optional JSON file for extracted-source hashes and results")
     args = parser.parse_args()
@@ -242,7 +255,8 @@ def main() -> int:
     baseline_dma = load_sources(tree, DMA_FILES, args.baseline_ref)
     candidate_dma = load_sources(tree, DMA_FILES, None)
     baseline_ctl = load_sources(tree, CTL_FILES, args.baseline_ref)
-    v1_ctl = load_sources(tree, CTL_FILES, V1_CONTROL_REF)
+    v1_ctl = load_sources(tree, CTL_FILES, args.v1_control_baseline_ref)
+    v2_ctl = load_sources(tree, CTL_FILES, args.v2_control_baseline_ref)
     candidate_ctl = load_sources(tree, CTL_FILES, None)
 
     dma_structs = ("virtio_pcm_msg", "virtio_pcm_substream")
@@ -284,6 +298,10 @@ def main() -> int:
                                                     "virtsnd_ctl_msg_cleanup",
                                                     "virtsnd_ctl_msg_enable"})),
         ]
+        v2_ctl_blocks = [
+            type_block(v2_ctl["sound/virtio/virtio_ctl_msg.c"], ctl_structs[0]),
+            *functions_in_order(v2_ctl, CTL_FUNCTIONS),
+        ]
         candidate_ctl_blocks = [
             type_block(candidate_ctl["sound/virtio/virtio_ctl_msg.c"], ctl_structs[0]),
             *functions_in_order(candidate_ctl, CTL_FUNCTIONS),
@@ -307,6 +325,10 @@ def main() -> int:
             CTL_HARNESS, "/* EXTRACTED_CONTROL_FUNCTIONS */", v1_ctl_blocks,
             temp / "v1-control-layout.c", ("#define TEST_LAYOUT_REGRESSION 1",),
         )
+        v2_ctl_c = compose(
+            CTL_HARNESS, "/* EXTRACTED_CONTROL_FUNCTIONS */", v2_ctl_blocks,
+            temp / "v2-control-alignment.c", ("#define TEST_V2_ALIGNMENT 1",),
+        )
         candidate_ctl_c = compose(
             CTL_HARNESS, "/* EXTRACTED_CONTROL_FUNCTIONS */", candidate_ctl_blocks,
             temp / "candidate-control.c", ("#define TEST_CANDIDATE 1",),
@@ -314,9 +336,10 @@ def main() -> int:
 
         binaries = [temp / "baseline-dma", temp / "candidate-dma",
                     temp / "baseline-control", temp / "candidate-control",
-                    temp / "v1-control-layout"]
+                    temp / "v1-control-layout", temp / "v2-control-alignment"]
         for source, binary in zip((baseline_dma_c, candidate_dma_c,
-                                   baseline_ctl_c, candidate_ctl_c, v1_ctl_c), binaries):
+                                   baseline_ctl_c, candidate_ctl_c, v1_ctl_c,
+                                   v2_ctl_c), binaries):
             compile_binary(cc, source, binary)
 
         run(binaries[0], "late-capture", expect_uaf=True)
@@ -327,6 +350,13 @@ def main() -> int:
         dma_output = run(binaries[1], "all")
         ctl_output = run(binaries[3], "all")
         v1_layout_output = run(binaries[4])
+        v2_layout_output = run(binaries[5])
+        v2_alignment_output = run(
+            binaries[5], "typed-access", expect_alignment_ubsan=True
+        )
+        v2_response_alignment_output = run(
+            binaries[5], "typed-response", expect_alignment_ubsan=True
+        )
 
     hashes_after = {
         relative: hashlib.sha256((tree / relative).read_bytes()).hexdigest()
@@ -335,12 +365,18 @@ def main() -> int:
     if hashes_after != hashes_before:
         raise RuntimeError("kernel source changed while the test runner was active")
     manifest = {
-        "schema": "virtio-snd-buffer-lifetime-source-extracted-v1",
+        "schema": "virtio-snd-control-dma-alignment-source-extracted-v2",
         "source_tree": str(tree),
         "baseline_ref": args.baseline_ref,
         "baseline_commit": baseline_commit,
-        "v1_control_layout_ref": V1_CONTROL_REF,
-        "v1_control_layout_commit": resolve_commit(tree, V1_CONTROL_REF),
+        "v1_control_layout_ref": args.v1_control_baseline_ref,
+        "v1_control_layout_commit": resolve_commit(
+            tree, args.v1_control_baseline_ref
+        ),
+        "v2_control_alignment_ref": args.v2_control_baseline_ref,
+        "v2_control_alignment_commit": resolve_commit(
+            tree, args.v2_control_baseline_ref
+        ),
         "kernel_built_or_booted": False,
         "host_shims_model_vmalloc_backing_and_virtqueue_dma": True,
         "baseline_expected_uaf_cases": [
@@ -351,6 +387,10 @@ def main() -> int:
         "v1_layout_regression_assertions": re.search(
             r"RESULT PASS assertions=(\d+)", v1_layout_output).group(1),
         "v1_layout_regression": "packed layout violates 64-byte and 128-byte cacheline isolation",
+        "v2_layout_assertions": re.search(
+            r"RESULT PASS assertions=(\d+)", v2_layout_output).group(1),
+        "v2_typed_alignment_ubsan": "misaligned address" in v2_alignment_output,
+        "v2_response_alignment_ubsan": "misaligned address" in v2_response_alignment_output,
         "source_sha256": hashes_after,
         "source_unchanged_during_run": True,
         "sanitizers": ["address", "undefined"],

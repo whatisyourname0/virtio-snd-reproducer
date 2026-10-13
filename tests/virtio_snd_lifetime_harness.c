@@ -45,6 +45,16 @@ typedef unsigned long snd_pcm_uframes_t;
 #define min_t(type, left, right) ((type)(left) < (type)(right) ? \
 				      (type)(left) : (type)(right))
 #define guard(type) test_guard_##type
+#ifdef TEST_STOPPED_LOCKING
+#define scoped_guard(type, lock) \
+	for (struct test_lock_scope __attribute__((cleanup(test_lock_scope_cleanup))) \
+	     __test_scope = test_lock_scope_begin(lock); \
+	     __test_scope.once; __test_scope.once = false)
+#define wait_event_interruptible_timeout(wait, condition, timeout) \
+	test_wait_event((wait), (condition), (timeout))
+#define wait_event_timeout(wait, condition, timeout) \
+	test_wait_event((wait), (condition), (timeout))
+#else
 #define scoped_guard(type, lock) \
 	for (unsigned int __guard_once = ((void)(lock), 1U); \
 	     __guard_once; __guard_once = 0)
@@ -52,6 +62,7 @@ typedef unsigned long snd_pcm_uframes_t;
 	((void)(wait), (void)(timeout), (condition) ? 1L : 0L)
 #define wait_event_timeout(wait, condition, timeout) \
 	((void)(wait), (void)(timeout), (condition) ? 1L : 0L)
+#endif
 #define dev_err(device, ...) ((void)(device))
 #define dev_warn(device, ...) ((void)(device))
 #define dev_err_ratelimited(device, ...) do { \
@@ -130,6 +141,7 @@ typedef struct wait_queue_head wait_queue_head_t;
 struct snd_pcm_indirect {
 	unsigned int sw_buffer_size;
 	unsigned int hw_buffer_size;
+	unsigned long sw_data;
 };
 struct virtio_pcm_substream {
 	struct virtio_snd *snd;
@@ -151,6 +163,124 @@ struct virtio_pcm_substream {
 	bool xfer_xrun;
 	bool stopped;
 	bool suspended;
+};
+
+#ifdef TEST_STOPPED_LOCKING
+#define TEST_LOCK_STACK_SIZE 16
+struct test_lock_scope {
+	unsigned int base_depth;
+	bool once;
+};
+
+static int *test_held_locks[TEST_LOCK_STACK_SIZE];
+static unsigned int test_lock_depth;
+static unsigned int test_lock_overflows;
+static unsigned int test_lock_underflows;
+static unsigned int stopped_accesses;
+static unsigned int stopped_access_violations;
+static unsigned int sleeping_with_lock;
+static unsigned int pending_lock_reentries;
+
+static void test_lock_push(int *lock)
+{
+	if (test_lock_depth == TEST_LOCK_STACK_SIZE) {
+		test_lock_overflows++;
+		return;
+	}
+	test_held_locks[test_lock_depth++] = lock;
+}
+
+static bool test_lock_held(int *lock)
+{
+	unsigned int i;
+
+	for (i = 0; i < test_lock_depth; i++)
+		if (test_held_locks[i] == lock)
+			return true;
+	return false;
+}
+
+static void test_lock_pop(void)
+{
+	if (!test_lock_depth) {
+		test_lock_underflows++;
+		return;
+	}
+	test_held_locks[--test_lock_depth] = NULL;
+}
+
+static struct test_lock_scope test_lock_scope_begin(int *lock)
+{
+	struct test_lock_scope scope = {
+		.base_depth = test_lock_depth,
+		.once = true,
+	};
+
+	test_lock_push(lock);
+	return scope;
+}
+
+static void test_lock_scope_cleanup(struct test_lock_scope *scope)
+{
+	if (test_lock_depth < scope->base_depth)
+		test_lock_underflows++;
+	while (test_lock_depth > scope->base_depth)
+		test_lock_pop();
+}
+
+static void test_guard_spinlock(int *lock)
+{
+	test_lock_push(lock);
+}
+
+static void test_guard_spinlock_irqsave(int *lock)
+{
+	test_lock_push(lock);
+}
+
+static bool *test_stopped_slot(struct virtio_pcm_substream *vss)
+{
+	stopped_accesses++;
+	if (!test_lock_held(&vss->lock))
+		stopped_access_violations++;
+	return &vss->stopped;
+}
+
+static void test_sleep_site(void)
+{
+	if (test_lock_depth)
+		sleeping_with_lock++;
+}
+
+static long test_wait_event(wait_queue_head_t wait, bool condition,
+			    unsigned int timeout)
+{
+	(void)wait;
+	(void)timeout;
+	test_sleep_site();
+	return condition ? 1L : 0L;
+}
+
+static void reset_lock_audit(void)
+{
+	memset(test_held_locks, 0, sizeof(test_held_locks));
+	test_lock_depth = 0;
+	test_lock_overflows = 0;
+	test_lock_underflows = 0;
+	stopped_accesses = 0;
+	stopped_access_violations = 0;
+	sleeping_with_lock = 0;
+	pending_lock_reentries = 0;
+}
+#else
+static void test_guard_spinlock(int *lock) { (void)lock; }
+static void test_guard_spinlock_irqsave(int *lock) { (void)lock; }
+static void test_sleep_site(void) { }
+#endif
+
+struct virtsnd_pcm_transfer {
+	struct snd_pcm_indirect indirect;
+	int error;
 };
 struct virtio_snd_msg {
 	struct scatterlist sg_request;
@@ -182,6 +312,10 @@ static unsigned int pcm_msg_alloc_calls;
 static unsigned int ctl_free_calls;
 static unsigned int ratelimited_errors;
 static long ctl_wait_result;
+static int indirect_transfer_error;
+static unsigned int indirect_transfer_calls;
+static bool inject_ack_on_release;
+static int release_ack_result;
 static const char *active_test;
 
 #define container_of(pointer, type, member) \
@@ -198,9 +332,6 @@ static const char *active_test;
 #define READ_ONCE(value) (value)
 #define cpu_to_le32(value) ((u32)(value))
 #define le32_to_cpu(value) ((u32)(value))
-
-static void test_guard_spinlock(int *lock) { (void)lock; }
-static void test_guard_spinlock_irqsave(int *lock) { (void)lock; }
 
 static void list_add_tail(struct list_head *node, struct list_head *head)
 {
@@ -253,6 +384,7 @@ static long wait_for_completion_interruptible_timeout(
 	struct completion *completion, unsigned int timeout)
 {
 	(void)timeout;
+	test_sleep_site();
 	if (completion->done)
 		return 1;
 	return ctl_wait_result;
@@ -288,6 +420,7 @@ static unsigned int virtsnd_msg_timeout_ms = 1000;
 static void cancel_work_sync(struct work_struct *work)
 {
 	(void)work;
+	test_sleep_site();
 	cancel_work_calls++;
 }
 
@@ -300,6 +433,23 @@ static void wake_up_all(wait_queue_head_t *wait)
 {
 	wait->wakes++;
 }
+
+#ifdef TEST_STOPPED_LOCKING
+static void virtsnd_pcm_msg_complete(struct virtio_pcm_msg *msg,
+				     size_t written_bytes)
+{
+	struct virtio_pcm_substream *vss = msg->substream;
+
+	(void)written_bytes;
+	test_lock_push(&vss->lock);
+	msg->length = 0;
+	if (vss->msg_count)
+		vss->msg_count--;
+	if (!vss->msg_count)
+		wake_up_all(&vss->msg_empty);
+	test_lock_pop();
+}
+#endif
 
 static void *snd_pcm_substream_chip(struct snd_pcm_substream *substream)
 {
@@ -356,6 +506,32 @@ static unsigned int snd_pcm_lib_buffer_bytes(
 	return active_vss ? active_vss->buffer_bytes : 0;
 }
 
+typedef void (*snd_pcm_indirect_copy_t)(struct snd_pcm_substream *substream,
+					 struct snd_pcm_indirect *rec,
+					 size_t bytes);
+
+static int snd_pcm_indirect_playback_transfer(
+	struct snd_pcm_substream *substream, struct snd_pcm_indirect *rec,
+	snd_pcm_indirect_copy_t copy)
+{
+	(void)substream;
+	(void)rec;
+	(void)copy;
+	indirect_transfer_calls++;
+	return indirect_transfer_error;
+}
+
+static int snd_pcm_indirect_capture_transfer(
+	struct snd_pcm_substream *substream, struct snd_pcm_indirect *rec,
+	snd_pcm_indirect_copy_t copy)
+{
+	(void)substream;
+	(void)rec;
+	(void)copy;
+	indirect_transfer_calls++;
+	return indirect_transfer_error;
+}
+
 static void virtsnd_pcm_msg_reset(struct virtio_pcm_substream *vss)
 {
 	unsigned int i;
@@ -377,6 +553,7 @@ static int virtsnd_pcm_dev_set_params(struct virtio_pcm_substream *vss,
 	(void)channels;
 	(void)format;
 	(void)rate;
+	test_sleep_site();
 	pcm_dev_set_params_calls++;
 	return 0;
 }
@@ -393,6 +570,7 @@ static int virtsnd_pcm_msg_alloc(struct virtio_pcm_substream *vss,
 	(void)vss;
 	(void)periods;
 	(void)period_bytes;
+	test_sleep_site();
 	pcm_msg_alloc_calls++;
 	return 0;
 }
@@ -464,6 +642,7 @@ static struct virtio_snd_msg *virtsnd_pcm_ctl_msg_alloc(
 
 	(void)vss;
 	(void)gfp;
+	test_sleep_site();
 	alloc_attempts[command % MAX_COMMANDS]++;
 	if (command == fail_alloc_command)
 		return NULL;
@@ -473,6 +652,11 @@ static struct virtio_snd_msg *virtsnd_pcm_ctl_msg_alloc(
 	return msg;
 }
 
+#ifdef TEST_STOPPED_LOCKING
+static int virtsnd_pcm_pb_ack(struct snd_pcm_substream *substream);
+static int virtsnd_pcm_cp_ack(struct snd_pcm_substream *substream);
+#endif
+
 static int virtsnd_ctl_msg_send_sync(struct virtio_snd *snd,
 				     struct virtio_snd_msg *msg)
 {
@@ -480,14 +664,25 @@ static int virtsnd_ctl_msg_send_sync(struct virtio_snd *snd,
 	int rc = 0;
 
 	(void)snd;
+	test_sleep_site();
 	if (sent_command_count < MAX_COMMANDS)
 		sent_commands[sent_command_count++] = command;
 	if (command == VIRTIO_SND_R_PCM_PREPARE)
 		prepare_commands++;
 	if (command == fail_send_command)
 		rc = fail_send_error;
-	if (command == VIRTIO_SND_R_PCM_RELEASE && active_vss)
+	if (command == VIRTIO_SND_R_PCM_RELEASE && active_vss) {
+#ifdef TEST_STOPPED_LOCKING
+		if (inject_ack_on_release) {
+			release_ack_result =
+				active_vss->direction == SNDRV_PCM_STREAM_PLAYBACK ?
+				virtsnd_pcm_pb_ack(active_vss->substream) :
+				virtsnd_pcm_cp_ack(active_vss->substream);
+			inject_ack_on_release = false;
+		}
+#endif
 		drain_pcm_queue(active_vss);
+	}
 	free(msg);
 	return rc;
 }
@@ -496,6 +691,24 @@ int virtsnd_pcm_msg_send(struct virtio_pcm_substream *vss,
 			 unsigned long offset, unsigned long bytes);
 unsigned int virtsnd_pcm_msg_pending_num(struct virtio_pcm_substream *vss);
 static int virtsnd_pcm_sync_stop(struct snd_pcm_substream *substream);
+#ifdef TEST_STOPPED_LOCKING
+static int virtsnd_pcm_pb_ack(struct snd_pcm_substream *substream);
+static int virtsnd_pcm_cp_ack(struct snd_pcm_substream *substream);
+
+unsigned int virtsnd_pcm_msg_pending_num(struct virtio_pcm_substream *vss)
+{
+	unsigned int count;
+
+	if (test_lock_held(&vss->lock)) {
+		pending_lock_reentries++;
+		return vss->msg_count;
+	}
+	test_lock_push(&vss->lock);
+	count = vss->msg_count;
+	test_lock_pop();
+	return count;
+}
+#endif
 
 static void *virtsnd_ctl_msg_request(struct virtio_snd_msg *msg)
 {
@@ -584,6 +797,10 @@ static void reset_faults(void)
 	ctl_free_calls = 0;
 	ratelimited_errors = 0;
 	ctl_wait_result = 0;
+	indirect_transfer_error = 0;
+	indirect_transfer_calls = 0;
+	inject_ack_on_release = false;
+	release_ack_result = 0;
 }
 
 static void test_capture_completion_clamps_reported_length(void)
@@ -824,6 +1041,185 @@ static void test_idle_sync_stop_quiesces_work_without_release(void)
 	CHECK(fixture.vss.msg_count == 0);
 }
 
+#ifdef TEST_STOPPED_LOCKING
+static void seed_pending_capture_message(struct fixture *fixture)
+{
+	struct virtqueue *vqueue = fixture->snd.rx_queue.vqueue;
+
+	fixture->vss.msg_count = 1;
+	fixture->messages[0].length = 64;
+	vqueue->pending_messages[0] = &fixture->messages[0];
+	vqueue->pending = 1;
+	vqueue->accepted = 1;
+}
+
+static void test_ack_failure_blocks_lifecycle_until_release(int direction)
+{
+	struct fixture fixture;
+	int rc;
+
+	active_test = direction == SNDRV_PCM_STREAM_PLAYBACK ?
+		"playback-ack-error-lifecycle-release" :
+		"capture-ack-error-lifecycle-release";
+	fixture_init(&fixture);
+	fixture.vss.direction = direction;
+	fixture.substream.stream = direction;
+	fixture.vss.xfer_enabled = true;
+	indirect_transfer_error = -EIO;
+
+	rc = direction == SNDRV_PCM_STREAM_PLAYBACK ?
+		virtsnd_pcm_pb_ack(&fixture.substream) :
+		virtsnd_pcm_cp_ack(&fixture.substream);
+	CHECK(rc == -EPIPE);
+	CHECK(fixture.vss.stopped);
+	CHECK(!fixture.vss.xfer_enabled);
+	CHECK(fixture.runtime.stop_operating);
+	CHECK(indirect_transfer_calls == 1);
+
+	CHECK(virtsnd_pcm_hw_params(&fixture.substream,
+				    &fixture.hw_params) == -EBADFD);
+	CHECK(virtsnd_pcm_prepare(&fixture.substream) == -EBADFD);
+	CHECK(pcm_dev_set_params_calls == 0);
+	CHECK(prepare_commands == 0);
+
+	indirect_transfer_error = 0;
+	CHECK(virtsnd_pcm_sync_stop(&fixture.substream) == 0);
+	CHECK(!fixture.vss.stopped);
+	CHECK(sent_command_count == 1);
+	CHECK(sent_commands[0] == VIRTIO_SND_R_PCM_RELEASE);
+
+	fixture.runtime.stop_operating = false;
+	CHECK(virtsnd_pcm_hw_params(&fixture.substream,
+				    &fixture.hw_params) == 0);
+	CHECK(virtsnd_pcm_prepare(&fixture.substream) == 0);
+	CHECK(prepare_commands == 1);
+}
+
+static void test_ack_during_release_is_rejected_and_release_clears_state(void)
+{
+	struct fixture fixture;
+
+	active_test = "ack-during-release";
+	fixture_init(&fixture);
+	seed_pending_capture_message(&fixture);
+	inject_ack_on_release = true;
+
+	CHECK(virtsnd_pcm_sync_stop(&fixture.substream) == 0);
+	CHECK(release_ack_result == -EPIPE);
+	CHECK(indirect_transfer_calls == 0);
+	CHECK(fixture.vss.msg_count == 0);
+	CHECK(fixture.snd.rx_queue.vqueue->pending == 0);
+	CHECK(!fixture.vss.stopped);
+	CHECK(sent_command_count == 1);
+	CHECK(sent_commands[0] == VIRTIO_SND_R_PCM_RELEASE);
+}
+
+static void test_open_detects_pending_io_and_retries_failed_release(void)
+{
+	struct fixture fixture;
+
+	active_test = "open-pending-release-retry";
+	fixture_init(&fixture);
+	fixture.substream.private_data = &fixture.pcm;
+	seed_pending_capture_message(&fixture);
+	fail_send_command = VIRTIO_SND_R_PCM_RELEASE;
+
+	CHECK(virtsnd_pcm_open(&fixture.substream) == -EIO);
+	CHECK(fixture.vss.stopped);
+	CHECK(pending_lock_reentries == 0);
+	CHECK(fixture.vss.msg_count == 0);
+
+	fail_send_command = UINT32_MAX;
+	CHECK(virtsnd_pcm_sync_stop(&fixture.substream) == 0);
+	CHECK(!fixture.vss.stopped);
+	CHECK(virtsnd_pcm_hw_params(&fixture.substream,
+				    &fixture.hw_params) == 0);
+	CHECK(virtsnd_pcm_prepare(&fixture.substream) == 0);
+}
+
+static void test_stop_and_suspend_publish_state_under_lock(void)
+{
+	struct fixture fixture;
+
+	active_test = "stop-suspend-locking";
+	fixture_init(&fixture);
+	CHECK(virtsnd_pcm_trigger(&fixture.substream,
+				  SNDRV_PCM_TRIGGER_STOP) == 0);
+	CHECK(fixture.vss.stopped);
+	CHECK(!fixture.vss.xfer_enabled);
+	CHECK(virtsnd_pcm_sync_stop(&fixture.substream) == 0);
+	CHECK(!fixture.vss.stopped);
+
+	CHECK(virtsnd_pcm_trigger(&fixture.substream,
+				  SNDRV_PCM_TRIGGER_SUSPEND) == 0);
+	CHECK(fixture.vss.stopped);
+	CHECK(fixture.vss.suspended);
+	CHECK(virtsnd_pcm_sync_stop(&fixture.substream) == 0);
+	CHECK(!fixture.vss.stopped);
+}
+
+static void test_failed_release_keeps_stopped_until_retry(void)
+{
+	struct fixture fixture;
+
+	active_test = "release-error-keeps-stopped";
+	fixture_init(&fixture);
+	fixture.vss.stopped = true;
+	fail_send_command = VIRTIO_SND_R_PCM_RELEASE;
+
+	CHECK(virtsnd_pcm_sync_stop(&fixture.substream) == -EIO);
+	CHECK(fixture.vss.stopped);
+	CHECK(virtsnd_pcm_hw_params(&fixture.substream,
+				    &fixture.hw_params) == -EBADFD);
+	CHECK(virtsnd_pcm_prepare(&fixture.substream) == -EBADFD);
+	CHECK(virtsnd_pcm_trigger(&fixture.substream,
+				  SNDRV_PCM_TRIGGER_START) == -EBADFD);
+	CHECK(sent_command_count == 1);
+
+	fail_send_command = UINT32_MAX;
+	CHECK(virtsnd_pcm_sync_stop(&fixture.substream) == 0);
+	CHECK(!fixture.vss.stopped);
+}
+
+static void test_stopped_lock_contract(void)
+{
+	active_test = "stopped-lock-audit";
+	CHECK(stopped_accesses > 0);
+	CHECK(stopped_access_violations == 0);
+	CHECK(sleeping_with_lock == 0);
+	CHECK(pending_lock_reentries == 0);
+	CHECK(test_lock_depth == 0);
+	CHECK(test_lock_overflows == 0);
+	CHECK(test_lock_underflows == 0);
+}
+
+int main(void)
+{
+	reset_faults();
+	reset_lock_audit();
+	test_ack_failure_blocks_lifecycle_until_release(
+		SNDRV_PCM_STREAM_PLAYBACK);
+	reset_faults();
+	test_ack_failure_blocks_lifecycle_until_release(
+		SNDRV_PCM_STREAM_CAPTURE);
+	reset_faults();
+	test_ack_during_release_is_rejected_and_release_clears_state();
+	reset_faults();
+	test_open_detects_pending_io_and_retries_failed_release();
+	reset_faults();
+	test_stop_and_suspend_publish_state_under_lock();
+	reset_faults();
+	test_failed_release_keeps_stopped_until_retry();
+	test_stopped_lock_contract();
+	if (failure_count) {
+		fprintf(stderr, "RESULT FAIL assertions=%u failures=%u\n",
+			assertion_count, failure_count);
+		return 1;
+	}
+	printf("RESULT PASS assertions=%u\n", assertion_count);
+	return 0;
+}
+#else
 int main(void)
 {
 	reset_faults();
@@ -852,3 +1248,4 @@ int main(void)
 	printf("RESULT PASS assertions=%u\n", assertion_count);
 	return 0;
 }
+#endif

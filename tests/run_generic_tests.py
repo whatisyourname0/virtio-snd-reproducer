@@ -22,7 +22,7 @@ REMOVE_HARNESS = LAB / "virtio_snd_remove_order_harness.c"
 MARKER = "/* EXTRACTED_VIRTSND_FUNCTIONS */"
 CTL_MARKER = "/* EXTRACTED_VIRTSND_CTL_FUNCTIONS */"
 REMOVE_MARKER = "/* EXTRACTED_VIRTSND_REMOVE */"
-BASELINE_DEFAULT = "HEAD~5"
+BASELINE_DEFAULT = "HEAD~6"
 EXPECTED_BASELINE_FAILURES = {
     "capture-length-clamp": (
         "fixture.vss.hw_ptr == 64",
@@ -74,6 +74,20 @@ OPTIONAL_FUNCTIONS = (
     ("sound/virtio/virtio_pcm_ops.c", "virtsnd_pcm_start_rollback"),
     ("sound/virtio/virtio_pcm_ops.c", "virtsnd_pcm_release_drain"),
 )
+STOPPED_ACK_FUNCTIONS = (
+    ("sound/virtio/virtio_pcm_ops.c", "virtsnd_pcm_trans_copy"),
+    ("sound/virtio/virtio_pcm_ops.c", "virtsnd_pcm_transfer_failed"),
+    ("sound/virtio/virtio_pcm_ops.c", "virtsnd_pcm_pb_ack"),
+    ("sound/virtio/virtio_pcm_ops.c", "virtsnd_pcm_cp_ack"),
+)
+STOPPED_EXCLUDED_FUNCTIONS = (
+    ("sound/virtio/virtio_pcm_msg.c", "virtsnd_pcm_msg_pending_num"),
+    ("sound/virtio/virtio_pcm_msg.c", "virtsnd_pcm_msg_complete"),
+)
+STOPPED_REQUIRED_FUNCTIONS = tuple(
+    function for function in REQUIRED_FUNCTIONS
+    if function not in STOPPED_EXCLUDED_FUNCTIONS
+) + STOPPED_ACK_FUNCTIONS
 
 REQUIRED_CTL_FUNCTIONS = (
     ("sound/virtio/virtio_ctl_msg.c", "virtsnd_ctl_msg_ref"),
@@ -182,11 +196,14 @@ def extract_set(
     sources: dict[str, str], *, require_optional: bool,
     required: tuple[tuple[str, str], ...] = REQUIRED_FUNCTIONS,
     optional: tuple[tuple[str, str], ...] = OPTIONAL_FUNCTIONS,
+    exclude: tuple[tuple[str, str], ...] = (),
 ) -> tuple[list[str], list[str]]:
     file_order = {relative: rank for rank, relative in enumerate(sources)}
     found: list[tuple[int, int, str]] = []
     extracted_names: list[str] = []
     for relative, name in (*required, *optional):
+        if (relative, name) in exclude:
+            continue
         source = sources[relative]
         try:
             offset, body = extract_function(source, name)
@@ -249,6 +266,61 @@ def compile_and_run(
     )
 
 
+def compile_stopped_and_run(
+    cc: list[str], harness_path: Path, marker: str, source_blocks: list[str],
+    label: str, temp: Path
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    harness = harness_path.read_text()
+    if harness.count(marker) != 1:
+        raise RuntimeError("expected exactly one production-code marker")
+
+    access_pattern = re.compile(r"\b([A-Za-z_]\w*(?:->\w+)*)->stopped\b")
+    instrumented_blocks: list[str] = []
+    access_count = 0
+    for block in source_blocks:
+        instrumented, count = access_pattern.subn(
+            r"(*test_stopped_slot(\1))", block
+        )
+        instrumented_blocks.append(instrumented)
+        access_count += count
+    if not access_count:
+        raise RuntimeError("stopped locking audit found no extracted stopped accesses")
+
+    generated = temp / f"{label}-stopped-lock-tests.c"
+    binary = temp / f"{label}-stopped-lock-tests"
+    extracted = "\n\n".join(instrumented_blocks)
+    prefix = "#define CONFIG_MMU 1\n#define TEST_STOPPED_LOCKING 1\n"
+    generated.write_text(prefix + harness.replace(marker, extracted))
+    command = [
+        *cc,
+        "-std=gnu11",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Wno-unused-function",
+        "-O1",
+        "-g",
+        "-fno-omit-frame-pointer",
+        "-fsanitize=address,undefined",
+        str(generated),
+        "-o",
+        str(binary),
+    ]
+    print(f"COMPILE {label}-stopped-lock: {' '.join(command)}")
+    subprocess.run(command, check=True)
+    environment = os.environ.copy()
+    environment.setdefault("ASAN_OPTIONS", "detect_leaks=0:halt_on_error=1")
+    environment.setdefault("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
+    result = subprocess.run(
+        [str(binary)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=environment,
+    )
+    return result, access_count
+
+
 def assertion_total(result: subprocess.CompletedProcess[str]) -> int:
     match = re.search(r"RESULT PASS assertions=(\d+)", result.stdout)
     if not match:
@@ -262,9 +334,13 @@ def main() -> int:
                         required=True, help="patched Linux source Git worktree")
     parser.add_argument("--baseline-ref", "--baseline", dest="baseline_ref",
                         default=BASELINE_DEFAULT,
-                        help="Git commit/ref containing the pre-series kernel source")
+                        help="Git ref before the five signed patches (default: HEAD~6)")
+    parser.add_argument("--stopped-baseline-ref", default="HEAD",
+                        help="Git ref for the source before the stopped-lock fix")
     parser.add_argument("--manifest-out", type=Path,
                         help="optional JSON file for extracted-source hashes and results")
+    parser.add_argument("--stopped-manifest-out", type=Path,
+                        help="optional JSON file for the focused stopped-lock audit")
     args = parser.parse_args()
 
     source_tree = args.kernel_tree.resolve()
@@ -274,13 +350,15 @@ def main() -> int:
     if not source_tree.is_dir():
         raise RuntimeError(f"kernel source tree not found: {source_tree}")
     baseline_commit = resolve_commit(source_tree, args.baseline_ref)
+    stopped_baseline_commit = resolve_commit(source_tree,
+                                             args.stopped_baseline_ref)
 
     source_names = sorted({
         relative
         for relative, _ in (
             REQUIRED_FUNCTIONS + OPTIONAL_FUNCTIONS +
             REQUIRED_CTL_FUNCTIONS + OPTIONAL_CTL_FUNCTIONS
-            + REQUIRED_REMOVE_FUNCTIONS
+            + REQUIRED_REMOVE_FUNCTIONS + STOPPED_ACK_FUNCTIONS
         )
     })
     candidate_bytes = {
@@ -291,6 +369,10 @@ def main() -> int:
     }
     baseline_sources = {
         relative: read_baseline(source_tree, args.baseline_ref, relative)
+        for relative in source_names
+    }
+    stopped_baseline_sources = {
+        relative: read_baseline(source_tree, args.stopped_baseline_ref, relative)
         for relative in source_names
     }
     baseline_blocks, baseline_functions = extract_set(
@@ -323,6 +405,20 @@ def main() -> int:
         required=REQUIRED_REMOVE_FUNCTIONS,
         optional=OPTIONAL_REMOVE_FUNCTIONS,
     )
+    stopped_baseline_blocks, stopped_baseline_functions = extract_set(
+        stopped_baseline_sources,
+        require_optional=False,
+        required=STOPPED_REQUIRED_FUNCTIONS,
+        optional=OPTIONAL_FUNCTIONS,
+        exclude=STOPPED_EXCLUDED_FUNCTIONS,
+    )
+    stopped_candidate_blocks, stopped_candidate_functions = extract_set(
+        candidate_sources,
+        require_optional=False,
+        required=STOPPED_REQUIRED_FUNCTIONS,
+        optional=OPTIONAL_FUNCTIONS,
+        exclude=STOPPED_EXCLUDED_FUNCTIONS,
+    )
 
     candidate_hashes = {
         relative: hashlib.sha256(source).hexdigest()
@@ -331,6 +427,10 @@ def main() -> int:
     baseline_hashes = {
         relative: hashlib.sha256(source.encode()).hexdigest()
         for relative, source in baseline_sources.items()
+    }
+    stopped_baseline_hashes = {
+        relative: hashlib.sha256(source.encode()).hexdigest()
+        for relative, source in stopped_baseline_sources.items()
     }
 
     with tempfile.TemporaryDirectory(prefix="virtio-snd-lifetime-") as temporary:
@@ -357,6 +457,16 @@ def main() -> int:
             cc, REMOVE_HARNESS, REMOVE_MARKER, candidate_remove_blocks,
             "candidate-remove", temp
         )
+        baseline_stopped_result, stopped_baseline_accesses = \
+            compile_stopped_and_run(
+                cc, HARNESS, MARKER, stopped_baseline_blocks,
+                "baseline", temp
+            )
+        candidate_stopped_result, stopped_candidate_accesses = \
+            compile_stopped_and_run(
+                cc, HARNESS, MARKER, stopped_candidate_blocks,
+                "candidate", temp
+            )
 
     print("--- BASELINE OUTPUT ---")
     print(f"returncode={baseline_result.returncode}")
@@ -376,6 +486,12 @@ def main() -> int:
     print("--- CANDIDATE REMOVE OUTPUT ---")
     print(f"returncode={candidate_remove_result.returncode}")
     print(candidate_remove_result.stdout, end="")
+    print("--- STOPPED BASELINE OUTPUT ---")
+    print(f"returncode={baseline_stopped_result.returncode}")
+    print(baseline_stopped_result.stdout, end="")
+    print("--- STOPPED CANDIDATE OUTPUT ---")
+    print(f"returncode={candidate_stopped_result.returncode}")
+    print(candidate_stopped_result.stdout, end="")
 
     if baseline_result.returncode == 0:
         raise RuntimeError("fault regression cases unexpectedly pass on baseline")
@@ -410,6 +526,19 @@ def main() -> int:
         raise RuntimeError("baseline did not reproduce the remove ordering contract failure")
     if candidate_remove_result.returncode != 0 or "RESULT PASS" not in candidate_remove_result.stdout:
         raise RuntimeError("working-tree candidate failed the removal order contract")
+    if baseline_stopped_result.returncode == 0 or (
+        "FAIL [stopped-lock-audit] stopped_access_violations == 0"
+        not in baseline_stopped_result.stdout
+    ):
+        raise RuntimeError("stopped-lock regression did not fail on its baseline")
+    for marker in ("AddressSanitizer", "runtime error:"):
+        if marker in baseline_stopped_result.stdout:
+            raise RuntimeError(
+                f"stopped baseline failed by sanitizer instead of lock audit: {marker}"
+            )
+    if (candidate_stopped_result.returncode != 0 or
+            "RESULT PASS" not in candidate_stopped_result.stdout):
+        raise RuntimeError("candidate failed the stopped-lock lifecycle audit")
 
     after_hashes = {
         relative: hashlib.sha256((source_tree / relative).read_bytes()).hexdigest()
@@ -419,7 +548,7 @@ def main() -> int:
         raise RuntimeError("kernel candidate source changed during the test run")
 
     manifest = {
-        "schema": "virtio-snd-source-extracted-lifetime-fault-tests-v2",
+        "schema": "virtio-snd-source-extracted-lifetime-fault-tests-v3",
         "candidate": str(source_tree),
         "baseline_ref": args.baseline_ref,
         "baseline_commit": baseline_commit,
@@ -431,6 +560,11 @@ def main() -> int:
         "baseline_control_extracted_functions": baseline_ctl_functions,
         "candidate_remove_extracted_functions": candidate_remove_functions,
         "baseline_remove_extracted_functions": baseline_remove_functions,
+        "stopped_baseline_ref": args.stopped_baseline_ref,
+        "stopped_baseline_commit": stopped_baseline_commit,
+        "stopped_baseline_sha256": stopped_baseline_hashes,
+        "stopped_baseline_extracted_functions": stopped_baseline_functions,
+        "stopped_candidate_extracted_functions": stopped_candidate_functions,
         "expected_baseline_failures": {
             case: list(assertions)
             for case, assertions in EXPECTED_BASELINE_FAILURES.items()
@@ -442,6 +576,7 @@ def main() -> int:
             "pcm": assertion_total(candidate_result),
             "control": assertion_total(candidate_ctl_result),
             "remove_order": assertion_total(candidate_remove_result),
+            "stopped_lock": assertion_total(candidate_stopped_result),
         },
         "baseline_returncode": baseline_result.returncode,
         "candidate_returncode": candidate_result.returncode,
@@ -449,6 +584,18 @@ def main() -> int:
         "candidate_control_returncode": candidate_ctl_result.returncode,
         "baseline_remove_returncode": baseline_remove_result.returncode,
         "candidate_remove_returncode": candidate_remove_result.returncode,
+        "stopped_baseline_returncode": baseline_stopped_result.returncode,
+        "stopped_candidate_returncode": candidate_stopped_result.returncode,
+        "stopped_baseline_source_accesses_instrumented":
+            stopped_baseline_accesses,
+        "stopped_candidate_source_accesses_instrumented":
+            stopped_candidate_accesses,
+        "stopped_baseline_expected_failure":
+            "FAIL [stopped-lock-audit] stopped_access_violations == 0",
+        "stopped_lock_instrumentation": (
+            "Each extracted stopped lvalue is checked against the held-lock "
+            "stack; sleep-capable shims reject held spinlocks."
+        ),
         "sanitizers": ["address", "undefined"],
         "kernel_built_or_booted": False,
         "source_unchanged_during_run": True,
@@ -458,6 +605,40 @@ def main() -> int:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         print(f"SOURCE_MANIFEST {output}")
+    if args.stopped_manifest_out:
+        stopped_output = {
+            "schema": "virtio-snd-stopped-lock-source-extracted-v1",
+            "baseline_ref": args.stopped_baseline_ref,
+            "baseline_commit": stopped_baseline_commit,
+            "candidate_tree": str(source_tree),
+            "baseline_sha256": stopped_baseline_hashes,
+            "candidate_sha256": candidate_hashes,
+            "baseline_functions": stopped_baseline_functions,
+            "candidate_functions": stopped_candidate_functions,
+            "baseline_source_accesses_instrumented":
+                stopped_baseline_accesses,
+            "candidate_source_accesses_instrumented":
+                stopped_candidate_accesses,
+            "baseline_returncode": baseline_stopped_result.returncode,
+            "baseline_expected_failure":
+                "FAIL [stopped-lock-audit] stopped_access_violations == 0",
+            "candidate_returncode": candidate_stopped_result.returncode,
+            "candidate_assertions": assertion_total(candidate_stopped_result),
+            "instrumentation": (
+                "The extracted C source is instrumented at each stopped "
+                "lvalue to check vss->lock ownership. Lock cleanup, nested "
+                "pending-count acquisition, and sleep-capable shims are "
+                "checked deterministically. This is not KCSAN or a scheduler "
+                "race run."
+            ),
+            "kernel_built_or_booted": False,
+        }
+        stopped_path = args.stopped_manifest_out.resolve()
+        stopped_path.parent.mkdir(parents=True, exist_ok=True)
+        stopped_path.write_text(
+            json.dumps(stopped_output, indent=2, sort_keys=True) + "\n"
+        )
+        print(f"STOPPED_SOURCE_MANIFEST {stopped_path}")
     return 0
 
 

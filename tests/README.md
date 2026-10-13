@@ -4,25 +4,30 @@ Run the source-extracted host suite from any current directory:
 
 ```sh
 python3 /path/to/virtio-snd-reproducer/tests/run_host_tests.py \
-  --kernel-tree /path/to/linux-with-the-five-patches-and-v2-overlay-applied \
-  --ack-baseline-ref HEAD \
-  --nommu-baseline-ref HEAD \
+  --kernel-tree /path/to/linux-with-v1-and-v2-committed-and-v3-applied \
+  --generic-baseline-ref HEAD~6 \
+  --lifetime-baseline-ref HEAD~3 \
+  --ack-baseline-ref HEAD~1 \
+  --nommu-baseline-ref HEAD~1 \
+  --stopped-baseline-ref HEAD \
+  --v1-control-baseline-ref HEAD~1 \
+  --v2-control-baseline-ref HEAD \
   --output-dir /tmp/virtio-snd-reproducer-results
 ```
 
+The source worktree is based on the pinned commit, has the five signed v1 patches applied, has the v2 overlay committed, and has the v3 overlay applied to the working tree.
 The runner requires Python, Git, and GCC or Clang with ASan and UBSan support.
 Set `CC` to select a compiler command.
 
-`run_generic_tests.py` compares the patched worktree with `HEAD~5` by default.
-`run_dma_control_lifetime_tests.py` compares it with `HEAD~2` by default.
-Pass `--baseline-ref` to either runner when the commit ancestry differs.
-`run_ack_tests.py` defaults to pinned v1 commit `9aac47803de024cd66c56cc594560c69b5a8a526` for local worktrees.
-For the packaged workflow, pass `--ack-baseline-ref HEAD` after applying the five signed patches and `kernel-patches/review-v2.diff`; the worktree diff is the candidate and `HEAD` remains the v1 ACK baseline.
-The aggregate runner accepts `--ack-baseline-ref` to select the pre-fix source ref.
-The NOMMU lifetime runner accepts `--baseline-ref`; the aggregate runner forwards `--nommu-baseline-ref`.
-For the packaged workflow, set `--nommu-baseline-ref HEAD` to compare the working-tree change against v1 after the five signed patches.
+`run_generic_tests.py` uses `HEAD~6` for the pre-series source by default.
+The DMA and control-payload lifetime checks use `HEAD~3`, after patches 1 through 3 and before patches 4 and 5.
+The stopped-lock check uses `HEAD` as its v2 baseline.
+The control-payload alignment checks use `HEAD~1` for v1 and `HEAD` for v2.
+The ACK and NOMMU lifetime runners use `HEAD~1` for their v1 baseline in this package workflow.
+Pass `--generic-baseline-ref`, `--lifetime-baseline-ref`, `--stopped-baseline-ref`, `--v1-control-baseline-ref`, `--v2-control-baseline-ref`, `--ack-baseline-ref`, or `--nommu-baseline-ref` when a worktree uses a different commit layout.
 
-The v2 candidate markers are 95 PCM assertions, 44 control lifetime assertions, 129 remove/freeze assertions, 80 DMA assertions, 232 control-payload assertions, 6 v1 layout assertions, and 525 NOMMU lifetime assertions.
+The v3 candidate markers include the PCM, control lifetime, remove/freeze, DMA, control-payload, v1 layout, and NOMMU lifetime assertions.
+The alignment runner also requires UBSan to reproduce misaligned typed request and response accesses on v2 before checking the v3 candidate.
 The pre-patch baseline is expected to trigger the recorded generic assertion failures and lifetime ASan use-after-free reports.
 Each runner validates those expected baseline outcomes and fails if the patched candidate does not pass.
 The ACK baseline produces four expected assertion failures: an error returned by each ACK path and unchanged indirect state after each ignored send error.

@@ -1,0 +1,147 @@
+diff --git a/sound/virtio/virtio_ctl_msg.c b/sound/virtio/virtio_ctl_msg.c
+index 84e2fb2562e4307d87c793beadeac965d0b3ec43..2e0ff15e729dad20af0ea31f31ac40c94a41b3cc 100644
+--- a/sound/virtio/virtio_ctl_msg.c
++++ b/sound/virtio/virtio_ctl_msg.c
+@@ -115,7 +115,7 @@ void *virtsnd_ctl_msg_response_data(struct virtio_snd_msg *msg)
+  * @sg: Scattergather entry for the region.
+  * @cursor: Current location in the message-owned DMA buffer.
+  * @size: Region length.
+- * @alignment: DMA cacheline alignment.
++ * @alignment: Alignment for DMA cachelines and typed CPU accesses.
+  *
+  * Context: Any context during message allocation.
+  * Return: 0 on success, -EOVERFLOW if the address cannot be represented.
+@@ -190,10 +190,12 @@ struct virtio_snd_msg *virtsnd_ctl_msg_alloc(size_t request_size,
+ 	cache_alignment = dma_get_cache_alignment();
+ 	if (cache_alignment <= 0)
+ 		return NULL;
+-	alignment = cache_alignment;
++	/* DMA coherence does not remove the CPU's type alignment requirement. */
++	alignment = max_t(size_t, cache_alignment,
++			  __alignof__(struct virtio_snd_ctl_value));
+ 
+ 	/* Reserve prefix alignment slack before the first DMA region. */
+-	dma_buffer_size = alignment;
++	dma_buffer_size = alignment - 1;
+ 	for (i = 0; i < ARRAY_SIZE(sizes); ++i) {
+ 		if (!sizes[i])
+ 			continue;
+@@ -219,7 +221,7 @@ struct virtio_snd_msg *virtsnd_ctl_msg_alloc(size_t request_size,
+ 		kfree(msg);
+ 		return NULL;
+ 	}
+-	data = (u8 *)msg->dma_buffer + 1;
++	data = msg->dma_buffer;
+ 	sgs[0] = &msg->sg_request;
+ 	sgs[1] = &msg->sg_response;
+ 	sgs[2] = &msg->sg_request_data;
+diff --git a/sound/virtio/virtio_pcm.h b/sound/virtio/virtio_pcm.h
+index 02547899743a272f278a07e28f4468429b430647..61faf7b13cbc13cf334f1d90434d3279fca1ca4b 100644
+--- a/sound/virtio/virtio_pcm.h
++++ b/sound/virtio/virtio_pcm.h
+@@ -27,13 +27,13 @@ struct page;
+  * @hw: Kernel ALSA substream hardware descriptor.
+  * @elapsed_period: Kernel work to handle the elapsed period state.
+  * @lock: Spinlock that protects fields shared by interrupt handlers and
+- *        substream operators.
++ *        substream operators, including @stopped.
+  * @buffer_bytes: Current buffer size in bytes.
+  * @hw_ptr: Substream hardware pointer value in bytes [0 ... buffer_bytes).
+  * @xfer_enabled: Data transfer state (0 - off, 1 - on).
+  * @xfer_xrun: Data underflow/overflow state (0 - no xrun, 1 - xrun).
+  * @stopped: True if the substream is stopped and must be released on the device
+- *           side.
++ *           side; protected by @lock.
+  * @suspended: True if the substream is suspended and must be reconfigured on
+  *             the device side at resume.
+  * @msgs: Allocated I/O messages.
+diff --git a/sound/virtio/virtio_pcm_ops.c b/sound/virtio/virtio_pcm_ops.c
+index ac2f28686632ea24728f71a14bd2a8b980be8da5..f74bf365065b6ae369ea57a1d4875bf73fe5b21b 100644
+--- a/sound/virtio/virtio_pcm_ops.c
++++ b/sound/virtio/virtio_pcm_ops.c
+@@ -126,7 +126,8 @@ static int virtsnd_pcm_open(struct snd_pcm_substream *substream)
+ 	snd_pcm_hw_constraint_integer(substream->runtime,
+ 				      SNDRV_PCM_HW_PARAM_PERIODS);
+ 
+-	vss->stopped |= !!virtsnd_pcm_msg_pending_num(vss);
++	scoped_guard(spinlock_irqsave, &vss->lock)
++		vss->stopped |= !!vss->msg_count;
+ 	vss->suspended = false;
+ 
+ 	/*
+@@ -228,14 +229,20 @@ static int virtsnd_pcm_hw_params(struct snd_pcm_substream *substream,
+ {
+ 	struct virtio_pcm_substream *vss = snd_pcm_substream_chip(substream);
+ 	struct virtio_device *vdev = vss->snd->vdev;
++	unsigned int msg_count;
++	bool stopped;
+ 	int rc;
+ 
+-	if (virtsnd_pcm_msg_pending_num(vss)) {
++	scoped_guard(spinlock_irqsave, &vss->lock) {
++		msg_count = vss->msg_count;
++		stopped = vss->stopped;
++	}
++	if (msg_count) {
+ 		dev_err(&vdev->dev, "SID %u: invalid I/O queue state\n",
+ 			vss->sid);
+ 		return -EBADFD;
+ 	}
+-	if (vss->stopped) {
++	if (stopped) {
+ 		dev_err(&vdev->dev, "SID %u: stream release failed\n",
+ 			vss->sid);
+ 		substream->runtime->stop_operating = true;
+@@ -290,8 +297,11 @@ static int virtsnd_pcm_prepare(struct snd_pcm_substream *substream)
+ 	struct virtio_pcm_substream *vss = snd_pcm_substream_chip(substream);
+ 	struct virtio_device *vdev = vss->snd->vdev;
+ 	struct virtio_snd_msg *msg;
++	bool stopped;
+ 
+-	if (vss->stopped) {
++	scoped_guard(spinlock_irqsave, &vss->lock)
++		stopped = vss->stopped;
++	if (stopped) {
+ 		dev_err(&vdev->dev, "SID %u: stream release failed\n",
+ 			vss->sid);
+ 		substream->runtime->stop_operating = true;
+@@ -392,10 +402,10 @@ static int virtsnd_pcm_trigger(struct snd_pcm_substream *substream, int command)
+ 		vss->suspended = true;
+ 		fallthrough;
+ 	case SNDRV_PCM_TRIGGER_STOP:
+-		vss->stopped = true;
+-		fallthrough;
+ 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+ 		scoped_guard(spinlock_irqsave, &vss->lock) {
++			if (command != SNDRV_PCM_TRIGGER_PAUSE_PUSH)
++				vss->stopped = true;
+ 			vss->xfer_enabled = false;
+ 		}
+ 
+@@ -432,14 +442,13 @@ static int virtsnd_pcm_sync_stop(struct snd_pcm_substream *substream)
+ 	scoped_guard(spinlock_irqsave, &vss->lock) {
+ 		vss->xfer_enabled = false;
+ 		need_release = vss->stopped || vss->msg_count;
++		if (need_release)
++			vss->stopped = true;
+ 	}
+ 	cancel_work_sync(&vss->elapsed_period);
+ 	if (!need_release)
+ 		return 0;
+ 
+-	scoped_guard(spinlock_irqsave, &vss->lock)
+-		vss->stopped = true;
+-
+ 	msg = virtsnd_pcm_ctl_msg_alloc(vss, VIRTIO_SND_R_PCM_RELEASE,
+ 					GFP_KERNEL);
+ 	if (!msg) {
+@@ -470,7 +479,8 @@ static int virtsnd_pcm_sync_stop(struct snd_pcm_substream *substream)
+ 		return !rc ? -ETIMEDOUT : rc;
+ 	}
+ 
+-	vss->stopped = false;
++	scoped_guard(spinlock_irqsave, &vss->lock)
++		vss->stopped = false;
+ 
+ 	return 0;
+ }

@@ -32,6 +32,8 @@ typedef unsigned int refcount_t;
 #define VIRTIO_SND_R_CTL_ENUM_ITEMS 0x0103
 #define VIRTIO_SND_R_CTL_INFO 0x0104
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
+#define max_t(type, left, right) \
+	((type)(left) > (type)(right) ? (type)(left) : (type)(right))
 #define cpu_to_le32(value) ((u32)(value))
 #define le32_to_cpu(value) ((u32)(value))
 #define READ_ONCE(value) (value)
@@ -65,6 +67,16 @@ struct virtio_snd_query_info {
 	u32 size;
 };
 struct virtio_snd_ctl_enum_item { u32 item_id; char name[32]; };
+struct virtio_snd_ctl_value {
+	union {
+		u32 integer[128];
+		uint64_t integer64[64];
+		u32 enumerated[128];
+		u8 bytes[512];
+	} value;
+};
+_Static_assert(_Alignof(struct virtio_snd_ctl_value) == _Alignof(uint64_t),
+	       "control values retain native 64-bit alignment");
 struct virtio_snd_ctl_info {
 	union { struct { u32 items; } enumerated; } value;
 };
@@ -485,7 +497,84 @@ static void expect_baseline_uaf(const char *scenario)
 }
 #endif
 
-#ifdef TEST_CANDIDATE
+#if defined(TEST_CANDIDATE) || defined(TEST_V2_ALIGNMENT)
+static const unsigned int control_dma_alignments[] = { 1, 2, 4, 8, 32, 64, 128 };
+
+static void test_control_dma_typed_access_alignment(unsigned int alignment)
+{
+	struct virtio_snd snd;
+	struct virtio_device vdev;
+	struct virtqueue vqueue;
+	struct virtio_snd_msg *msg;
+	struct virtio_snd_ctl_hdr *header;
+	struct virtio_snd_ctl_value *value;
+	struct virtio_snd_ctl_value *response_value;
+
+	active_test = "typed-control-header-and-integer64-alignment";
+	reset_fixture(&snd, &vdev, &vqueue);
+	test_dma_cache_alignment = alignment;
+	msg = virtsnd_ctl_msg_alloc(sizeof(*header) + sizeof(*value),
+				    sizeof(struct virtio_snd_hdr), 0,
+				    sizeof(*response_value), GFP_KERNEL);
+	CHECK(msg != NULL);
+	if (!msg)
+		return;
+
+	header = virtsnd_ctl_msg_request(msg);
+	value = (void *)((u8 *)header + sizeof(*header));
+	response_value = virtsnd_ctl_msg_response_data(msg);
+	CHECK((uintptr_t)header % _Alignof(struct virtio_snd_ctl_hdr) == 0);
+	CHECK((uintptr_t)value % _Alignof(struct virtio_snd_ctl_value) == 0);
+	CHECK((uintptr_t)response_value % _Alignof(struct virtio_snd_ctl_value) == 0);
+	header->hdr.code = 0x12345678U;
+	header->control_id = 0x87654321U;
+	value->value.integer64[0] = UINT64_C(0x0123456789abcdef);
+	response_value->value.integer64[63] = UINT64_C(0xfedcba9876543210);
+	CHECK(header->hdr.code == 0x12345678U);
+	CHECK(header->control_id == 0x87654321U);
+	CHECK(value->value.integer64[0] == UINT64_C(0x0123456789abcdef));
+	CHECK(response_value->value.integer64[63] ==
+	      UINT64_C(0xfedcba9876543210));
+	virtsnd_ctl_msg_unref(msg);
+	CHECK(live_allocations == 0);
+}
+
+static void test_control_dma_response_data_alignment(unsigned int alignment)
+{
+	struct virtio_snd snd;
+	struct virtio_device vdev;
+	struct virtqueue vqueue;
+	struct virtio_snd_msg *msg;
+	struct virtio_snd_ctl_value *response_value;
+
+	active_test = "odd-header-sizes-align-response-data-for-integer64";
+	reset_fixture(&snd, &vdev, &vqueue);
+	test_dma_cache_alignment = alignment;
+	msg = virtsnd_ctl_msg_alloc(13, 7, 0,
+				    sizeof(*response_value), GFP_KERNEL);
+	CHECK(msg != NULL);
+	if (!msg)
+		return;
+
+	response_value = virtsnd_ctl_msg_response_data(msg);
+	CHECK((uintptr_t)response_value % _Alignof(struct virtio_snd_ctl_value) == 0);
+	response_value->value.integer64[63] = UINT64_C(0xa1b2c3d4e5f60718);
+	CHECK(response_value->value.integer64[63] ==
+	      UINT64_C(0xa1b2c3d4e5f60718));
+	virtsnd_ctl_msg_unref(msg);
+	CHECK(live_allocations == 0);
+}
+
+static void test_control_dma_typed_access_alignments(void)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(control_dma_alignments); ++i) {
+		test_control_dma_typed_access_alignment(control_dma_alignments[i]);
+		test_control_dma_response_data_alignment(control_dma_alignments[i]);
+	}
+}
+#endif
+
+#if defined(TEST_CANDIDATE) || defined(TEST_V2_ALIGNMENT)
 static void test_dma_segment_cacheline_isolation(struct virtio_snd_msg *msg,
 						 size_t alignment)
 {
@@ -513,7 +602,8 @@ static void test_dma_segment_cacheline_isolation(struct virtio_snd_msg *msg,
 		start = (uintptr_t)segments[i]->address;
 		end = cacheline_end(start + segments[i]->length, alignment);
 		CHECK(start % alignment == 0);
-		CHECK(start > (uintptr_t)msg->dma_buffer);
+		CHECK(start % _Alignof(struct virtio_snd_ctl_value) == 0);
+		CHECK(start >= (uintptr_t)msg->dma_buffer);
 		CHECK(allocation_contains(msg->dma_buffer, (void *)start,
 					  end - start));
 		CHECK(end <= metadata_start || start >= metadata_end);
@@ -524,19 +614,20 @@ static void test_dma_segment_cacheline_isolation(struct virtio_snd_msg *msg,
 		++region_count;
 	}
 }
+#endif
 
+#ifdef TEST_CANDIDATE
 static void test_dma_layout_cacheline_alignments(void)
 {
 	struct virtio_snd snd;
 	struct virtio_device vdev;
 	struct virtqueue vqueue;
 	struct virtio_snd_msg *msg;
-	static const unsigned int alignments[] = { 32, 64, 128 };
 
-	for (unsigned int i = 0; i < ARRAY_SIZE(alignments); ++i) {
+	for (unsigned int i = 0; i < ARRAY_SIZE(control_dma_alignments); ++i) {
 		active_test = "dma-layout-cacheline-alignment-and-region-isolation";
 		reset_fixture(&snd, &vdev, &vqueue);
-		test_dma_cache_alignment = alignments[i];
+		test_dma_cache_alignment = control_dma_alignments[i];
 		msg = virtsnd_ctl_msg_alloc(13, 7, 35, 130, GFP_KERNEL);
 		CHECK(msg != NULL);
 		if (!msg)
@@ -545,7 +636,8 @@ static void test_dma_layout_cacheline_alignments(void)
 		CHECK(msg->sg_response.length == 7);
 		CHECK(msg->sg_request_data.length == 35);
 		CHECK(msg->sg_response_data.length == 130);
-		test_dma_segment_cacheline_isolation(msg, alignments[i]);
+		test_dma_segment_cacheline_isolation(msg,
+						     control_dma_alignments[i]);
 		virtsnd_ctl_msg_unref(msg);
 		CHECK(live_allocations == 0);
 	}
@@ -562,6 +654,7 @@ static void test_dma_layout_cacheline_alignments(void)
 		virtsnd_ctl_msg_unref(msg);
 	}
 	CHECK(live_allocations == 0);
+	test_control_dma_typed_access_alignments();
 }
 
 static void test_tlv_read_success_and_owned_timeout(void)
@@ -938,6 +1031,30 @@ static void test_cancel_keeps_queue_ref_for_late_callback(void)
 }
 #endif
 
+#ifdef TEST_V2_ALIGNMENT
+static void test_v2_layout_cacheline_isolation(void)
+{
+	struct virtio_snd snd;
+	struct virtio_device vdev;
+	struct virtqueue vqueue;
+	struct virtio_snd_msg *msg;
+	static const unsigned int alignments[] = { 32, 64, 128 };
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(alignments); ++i) {
+		active_test = "v2-layout-preserves-cacheline-region-isolation";
+		reset_fixture(&snd, &vdev, &vqueue);
+		test_dma_cache_alignment = alignments[i];
+		msg = virtsnd_ctl_msg_alloc(13, 7, 35, 130, GFP_KERNEL);
+		CHECK(msg != NULL);
+		if (!msg)
+			continue;
+		test_dma_segment_cacheline_isolation(msg, alignments[i]);
+		virtsnd_ctl_msg_unref(msg);
+		CHECK(live_allocations == 0);
+	}
+}
+#endif
+
 #ifdef TEST_LAYOUT_REGRESSION
 static bool v1_layout_has_cacheline_violation(struct virtio_snd_msg *msg,
 						      size_t alignment)
@@ -1010,9 +1127,31 @@ int main(int argc, char **argv)
 	expect_baseline_uaf(argv[1]);
 	return 0;
 #elif defined(TEST_LAYOUT_REGRESSION)
-	(void)argc;
 	(void)argv;
-	test_v1_layout_cacheline_regression();
+	if (argc == 1)
+		test_v1_layout_cacheline_regression();
+	else {
+		fprintf(stderr, "expected no argument\n");
+		return 2;
+	}
+	if (failures) {
+		fprintf(stderr, "RESULT FAIL assertions=%u failures=%u\n",
+			assertions, failures);
+		return 1;
+	}
+	printf("RESULT PASS assertions=%u\n", assertions);
+	return 0;
+#elif defined(TEST_V2_ALIGNMENT)
+	if (argc == 2 && !strcmp(argv[1], "typed-access"))
+		test_control_dma_typed_access_alignments();
+	else if (argc == 2 && !strcmp(argv[1], "typed-response"))
+		test_control_dma_response_data_alignment(4);
+	else if (argc == 1)
+		test_v2_layout_cacheline_isolation();
+	else {
+		fprintf(stderr, "expected no argument, typed-access, or typed-response\n");
+		return 2;
+	}
 	if (failures) {
 		fprintf(stderr, "RESULT FAIL assertions=%u failures=%u\n",
 			assertions, failures);

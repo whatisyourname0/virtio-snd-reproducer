@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Run source-extracted host regressions for the v2 review overlay."""
+"""Run source-extracted host regressions for the v3 review overlay."""
 
 from __future__ import annotations
 
@@ -14,7 +14,13 @@ import sys
 from pathlib import Path
 
 TESTS = Path(__file__).resolve().parent
-ACK_BASELINE_DEFAULT = "9aac47803de024cd66c56cc594560c69b5a8a526"
+GENERIC_BASELINE_DEFAULT = "HEAD~6"
+LIFETIME_BASELINE_DEFAULT = "HEAD~3"
+ACK_BASELINE_DEFAULT = "HEAD~1"
+NOMMU_BASELINE_DEFAULT = "HEAD~1"
+STOPPED_BASELINE_DEFAULT = "HEAD"
+V1_CONTROL_BASELINE_DEFAULT = "HEAD~1"
+V2_CONTROL_BASELINE_DEFAULT = "HEAD"
 
 
 def compiler_description() -> str:
@@ -40,27 +46,45 @@ def main() -> int:
         "--kernel-tree",
         type=Path,
         required=True,
-        help="Linux Git worktree with the five patches and v2 overlay applied",
+        help=(
+            "Linux Git worktree with v1 patches and committed v2 overlay, "
+            "plus v3 overlay"
+        ),
     )
     parser.add_argument(
         "--generic-baseline-ref",
-        default="HEAD~5",
-        help="source ref before all five patches (default: HEAD~5)",
+        default=GENERIC_BASELINE_DEFAULT,
+        help="source ref before all five patches (default: HEAD~6)",
     )
     parser.add_argument(
         "--lifetime-baseline-ref",
-        default="HEAD~2",
-        help="source ref after patches 1-3 and before patches 4-5 (default: HEAD~2)",
+        default=LIFETIME_BASELINE_DEFAULT,
+        help="source ref after patches 1-3 and before patches 4-5 (default: HEAD~3)",
     )
     parser.add_argument(
         "--ack-baseline-ref",
         default=ACK_BASELINE_DEFAULT,
-        help="source ref before the PCM ACK fix (default: pinned v1 source)",
+        help="source ref after the signed v1 patch series (default: HEAD~1)",
     )
     parser.add_argument(
         "--nommu-baseline-ref",
-        default=ACK_BASELINE_DEFAULT,
-        help="source ref before NOMMU PCM bounce pages (default: pinned v1 source)",
+        default=NOMMU_BASELINE_DEFAULT,
+        help="source ref after the signed v1 patch series (default: HEAD~1)",
+    )
+    parser.add_argument(
+        "--stopped-baseline-ref",
+        default=STOPPED_BASELINE_DEFAULT,
+        help="source ref before the stopped-lock fix (default: committed v2 overlay)",
+    )
+    parser.add_argument(
+        "--v1-control-baseline-ref",
+        default=V1_CONTROL_BASELINE_DEFAULT,
+        help="source ref after the signed v1 patch series (default: HEAD~1)",
+    )
+    parser.add_argument(
+        "--v2-control-baseline-ref",
+        default=V2_CONTROL_BASELINE_DEFAULT,
+        help="source ref after the committed v2 overlay (default: HEAD)",
     )
     parser.add_argument(
         "--output-dir",
@@ -84,6 +108,9 @@ def main() -> int:
     print(f"LIFETIME_BASELINE_REF {args.lifetime_baseline_ref}")
     print(f"ACK_BASELINE_REF {args.ack_baseline_ref}")
     print(f"NOMMU_BASELINE_REF {args.nommu_baseline_ref}")
+    print(f"STOPPED_BASELINE_REF {args.stopped_baseline_ref}")
+    print(f"V1_CONTROL_BASELINE_REF {args.v1_control_baseline_ref}")
+    print(f"V2_CONTROL_BASELINE_REF {args.v2_control_baseline_ref}")
 
     suites = (
         (
@@ -111,6 +138,26 @@ def main() -> int:
             "--baseline-ref",
             baseline_ref,
         ]
+        if name == "generic":
+            command.extend(
+                ["--stopped-baseline-ref", args.stopped_baseline_ref]
+            )
+            if output_dir:
+                command.extend(
+                    [
+                        "--stopped-manifest-out",
+                        str(output_dir / "generic-stopped-manifest.json"),
+                    ]
+                )
+        elif name == "dma-control-lifetime":
+            command.extend(
+                [
+                    "--v1-control-baseline-ref",
+                    args.v1_control_baseline_ref,
+                    "--v2-control-baseline-ref",
+                    args.v2_control_baseline_ref,
+                ]
+            )
         if output_dir:
             command.extend(
                 ["--manifest-out", str(output_dir / f"{name}-manifest.json")]
