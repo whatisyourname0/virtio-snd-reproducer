@@ -5,11 +5,12 @@ set -euo pipefail
 : "${KERNEL_COMMIT:?KERNEL_COMMIT is required}"
 : "${KERNEL_REF:?KERNEL_REF is required}"
 : "${BUILD_JOBS:?BUILD_JOBS is required}"
+CANDIDATE_OVERLAY_SHA256=${CANDIDATE_OVERLAY_SHA256:-}
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
-  bc bison build-essential ca-certificates cpio flex libelf-dev libssl-dev \
+  bc bison build-essential ca-certificates cpio flex git libelf-dev libssl-dev \
   make perl python3 rsync tar xz-utils gzip
 rm -rf /var/lib/apt/lists/*
 
@@ -22,8 +23,25 @@ src=/tmp/linux-source
 out=/tmp/linux-build
 rootfs=/tmp/modules-root
 observer=/tmp/observer
-mkdir -p "$src" "$out" "$rootfs" "$observer"
+mkdir -p "$src" "$out" "$rootfs" "$observer" /out
 tar -xzf /source.tar.gz -C "$src"
+if [[ -n "$CANDIDATE_OVERLAY_SHA256" ]]; then
+  [[ -r /out/candidate-overlay.diff ]] || {
+    echo "candidate overlay was requested but not mounted" >&2
+    exit 1
+  }
+  actual_overlay_sha=$(sha256sum /out/candidate-overlay.diff | cut -d' ' -f1)
+  [[ "$actual_overlay_sha" == "$CANDIDATE_OVERLAY_SHA256" ]] || {
+    echo "candidate overlay hash mismatch" >&2
+    exit 1
+  }
+  git -C "$src" apply --check --whitespace=error /out/candidate-overlay.diff
+  git -C "$src" apply --whitespace=error /out/candidate-overlay.diff
+elif [[ -e /out/candidate-overlay.diff ]]; then
+  echo "unexpected candidate overlay in source variant" >&2
+  exit 1
+fi
+printf '%s\n' "${CANDIDATE_OVERLAY_SHA256:-none}" > /out/source-overlay-sha256.txt
 
 /configure-kasan.sh "$src" "$out"
 release=$(make -s -C "$src" O="$out" ARCH=arm64 kernelrelease)

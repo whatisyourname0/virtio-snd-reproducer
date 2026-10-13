@@ -25,6 +25,10 @@ typedef unsigned int refcount_t;
 #define scoped_guard(type, lock) \
 	for (unsigned int __guard_once = ((void)(lock), 1U); \
 	     __guard_once; __guard_once = 0)
+#define spin_lock_irqsave(lock, flags) \
+	do { (void)(lock); (flags) = 0; } while (0)
+#define spin_unlock_irqrestore(lock, flags) \
+	do { (void)(lock); (void)(flags); } while (0)
 #define container_of(pointer, type, member) \
 	((type *)((char *)(pointer) - offsetof(type, member)))
 #define list_entry(pointer, type, member) container_of(pointer, type, member)
@@ -53,6 +57,7 @@ struct virtio_snd_msg {
 	struct completion notify;
 	refcount_t ref_count;
 	bool cancelled;
+	void *dma_buffer;
 	union {
 		struct virtio_snd_hdr align;
 		unsigned char bytes[2 * sizeof(struct virtio_snd_hdr)];
@@ -140,6 +145,8 @@ static bool refcount_dec_and_test(refcount_t *ref_count)
 
 static void kfree(void *pointer)
 {
+	if (!pointer)
+		return;
 	freed_count++;
 	free(pointer);
 }

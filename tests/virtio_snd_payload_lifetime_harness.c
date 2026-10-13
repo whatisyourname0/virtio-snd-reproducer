@@ -31,6 +31,7 @@ typedef unsigned int refcount_t;
 #define VIRTIO_SND_R_CTL_TLV_COMMAND 0x0102
 #define VIRTIO_SND_R_CTL_ENUM_ITEMS 0x0103
 #define VIRTIO_SND_R_CTL_INFO 0x0104
+#define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
 #define cpu_to_le32(value) ((u32)(value))
 #define le32_to_cpu(value) ((u32)(value))
 #define READ_ONCE(value) (value)
@@ -43,6 +44,10 @@ typedef unsigned int refcount_t;
 #define scoped_guard(type, lock) \
 	for (unsigned int __guard_once = ((void)(lock), 1U); \
 	     __guard_once; __guard_once = 0)
+#define spin_lock_irqsave(lock, flags) \
+	do { (void)(lock); (flags) = 0; } while (0)
+#define spin_unlock_irqrestore(lock, flags) \
+	do { (void)(lock); (void)(flags); } while (0)
 
 struct scatterlist {
 	void *address;
@@ -205,18 +210,25 @@ static inline int copy_to_user(void *destination, const void *source,
 struct allocation_record { void *base; size_t size; bool live; };
 static struct allocation_record allocations[256];
 static unsigned int allocation_count;
-static unsigned int live_messages;
+static unsigned int live_allocations;
 static size_t live_bytes;
 static unsigned int message_allocations;
 static unsigned int message_frees;
 static size_t max_allocation_size = 1024U * 1024U;
-static bool fail_next_message_allocation;
+static unsigned int fail_kzalloc_at;
+static unsigned int kzalloc_calls;
+static unsigned int test_dma_cache_alignment = 64;
+static int dma_get_cache_alignment(void)
+{
+	return test_dma_cache_alignment;
+}
 static void *kzalloc(size_t size, gfp_t flags)
 {
 	void *memory;
 	(void)flags;
-	if (fail_next_message_allocation) {
-		fail_next_message_allocation = false;
+	++kzalloc_calls;
+	if (fail_kzalloc_at && kzalloc_calls == fail_kzalloc_at) {
+		fail_kzalloc_at = 0;
 		return NULL;
 	}
 	if (!size || size > max_allocation_size ||
@@ -228,7 +240,7 @@ static void *kzalloc(size_t size, gfp_t flags)
 	allocations[allocation_count++] = (struct allocation_record) {
 		.base = memory, .size = size, .live = true,
 	};
-	++live_messages;
+	++live_allocations;
 	live_bytes += size;
 	++message_allocations;
 	return memory;
@@ -238,7 +250,7 @@ static void kfree(void *memory)
 	for (unsigned int i = 0; i < allocation_count; ++i) {
 		if (allocations[i].base == memory && allocations[i].live) {
 			allocations[i].live = false;
-			--live_messages;
+			--live_allocations;
 			live_bytes -= allocations[i].size;
 			++message_frees;
 			free(memory);
@@ -258,6 +270,12 @@ static bool allocation_contains(const void *base, const void *address,
 				length <= allocations[i].size - (target - start);
 	}
 	return false;
+}
+static uintptr_t cacheline_end(uintptr_t address, size_t alignment)
+{
+	size_t remainder = address % alignment;
+
+	return remainder ? address + alignment - remainder : address;
 }
 static bool allocation_is_live(const void *base)
 {
@@ -323,6 +341,16 @@ static int virtqueue_add_sgs(struct virtqueue *vqueue,
 
 /* EXTRACTED_CONTROL_FUNCTIONS */
 
+static bool message_owns_payload(struct virtio_snd_msg *msg,
+				const void *address, size_t length)
+{
+#if defined(TEST_BASELINE) || defined(TEST_LAYOUT_REGRESSION)
+	return allocation_contains(msg, address, length);
+#else
+	return allocation_contains(msg->dma_buffer, address, length);
+#endif
+}
+
 static void device_complete_one(struct virtqueue *vqueue)
 {
 	struct virtio_snd_msg *msg;
@@ -349,8 +377,8 @@ static void device_complete_one(struct virtqueue *vqueue)
 		struct scatterlist *payload = &vqueue->descs[index][nouts + 1];
 		unsigned char *bytes = payload->address;
 
-		response_payload_owned = allocation_contains(msg, bytes,
-							     payload->length);
+		response_payload_owned = message_owns_payload(msg, bytes,
+							      payload->length);
 		for (unsigned int i = 0; i < payload->length; ++i)
 			bytes[i] = (unsigned char)(response_fill + i);
 	}
@@ -380,8 +408,8 @@ static void device_touch_late(struct virtqueue *vqueue, bool device_writes)
 	payload = &vqueue->descs[index][device_writes ? nouts + 1 : 1];
 	if (device_writes) {
 		volatile unsigned char *bytes = payload->address;
-		response_payload_owned = allocation_contains(msg, payload->address,
-							     payload->length);
+		response_payload_owned = message_owns_payload(msg, payload->address,
+							      payload->length);
 		for (unsigned int i = 0; i < payload->length; ++i)
 			bytes[i] = (unsigned char)(0x60U + i);
 	} else {
@@ -408,7 +436,9 @@ static void reset_fixture(struct virtio_snd *snd, struct virtio_device *vdev,
 	outgoing_payload_matches = false;
 	response_payload_owned = false;
 	response_fill = 0xa0;
-	fail_next_message_allocation = false;
+	fail_kzalloc_at = 0;
+	kzalloc_calls = 0;
+	test_dma_cache_alignment = 64;
 }
 
 #ifdef TEST_BASELINE
@@ -456,6 +486,84 @@ static void expect_baseline_uaf(const char *scenario)
 #endif
 
 #ifdef TEST_CANDIDATE
+static void test_dma_segment_cacheline_isolation(struct virtio_snd_msg *msg,
+						 size_t alignment)
+{
+	struct scatterlist *segments[] = {
+		&msg->sg_request,
+		&msg->sg_response,
+		&msg->sg_request_data,
+		&msg->sg_response_data,
+	};
+	uintptr_t starts[ARRAY_SIZE(segments)];
+	uintptr_t ends[ARRAY_SIZE(segments)];
+	uintptr_t metadata_start = (uintptr_t)msg;
+	uintptr_t metadata_end = cacheline_end(metadata_start + sizeof(*msg),
+					       alignment);
+	unsigned int region_count = 0;
+
+	metadata_start -= metadata_start % alignment;
+	for (unsigned int i = 0; i < ARRAY_SIZE(segments); ++i) {
+		uintptr_t start;
+		uintptr_t end;
+
+		if (!segments[i]->length)
+			continue;
+
+		start = (uintptr_t)segments[i]->address;
+		end = cacheline_end(start + segments[i]->length, alignment);
+		CHECK(start % alignment == 0);
+		CHECK(start > (uintptr_t)msg->dma_buffer);
+		CHECK(allocation_contains(msg->dma_buffer, (void *)start,
+					  end - start));
+		CHECK(end <= metadata_start || start >= metadata_end);
+		for (unsigned int j = 0; j < region_count; ++j)
+			CHECK(end <= starts[j] || start >= ends[j]);
+		starts[region_count] = start;
+		ends[region_count] = end;
+		++region_count;
+	}
+}
+
+static void test_dma_layout_cacheline_alignments(void)
+{
+	struct virtio_snd snd;
+	struct virtio_device vdev;
+	struct virtqueue vqueue;
+	struct virtio_snd_msg *msg;
+	static const unsigned int alignments[] = { 32, 64, 128 };
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(alignments); ++i) {
+		active_test = "dma-layout-cacheline-alignment-and-region-isolation";
+		reset_fixture(&snd, &vdev, &vqueue);
+		test_dma_cache_alignment = alignments[i];
+		msg = virtsnd_ctl_msg_alloc(13, 7, 35, 130, GFP_KERNEL);
+		CHECK(msg != NULL);
+		if (!msg)
+			continue;
+		CHECK(msg->sg_request.length == 13);
+		CHECK(msg->sg_response.length == 7);
+		CHECK(msg->sg_request_data.length == 35);
+		CHECK(msg->sg_response_data.length == 130);
+		test_dma_segment_cacheline_isolation(msg, alignments[i]);
+		virtsnd_ctl_msg_unref(msg);
+		CHECK(live_allocations == 0);
+	}
+
+	active_test = "header-only-dma-regions-do-not-share-cacheline";
+	reset_fixture(&snd, &vdev, &vqueue);
+	test_dma_cache_alignment = 128;
+	msg = virtsnd_ctl_msg_alloc(8, 4, 0, 0, GFP_KERNEL);
+	CHECK(msg != NULL);
+	if (msg) {
+		CHECK(msg->sg_request_data.length == 0);
+		CHECK(msg->sg_response_data.length == 0);
+		test_dma_segment_cacheline_isolation(msg, 128);
+		virtsnd_ctl_msg_unref(msg);
+	}
+	CHECK(live_allocations == 0);
+}
+
 static void test_tlv_read_success_and_owned_timeout(void)
 {
 	struct virtio_snd snd;
@@ -480,7 +588,7 @@ static void test_tlv_read_success_and_owned_timeout(void)
 	CHECK(user_tlv[0] == response_fill);
 	CHECK(user_tlv[sizeof(user_tlv) - 1] ==
 	      (unsigned char)(response_fill + sizeof(user_tlv) - 1));
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 
 	active_test = "tlv-read-timeout-user-buffer-unchanged";
 	reset_fixture(&snd, &vdev, &vqueue);
@@ -492,13 +600,13 @@ static void test_tlv_read_success_and_owned_timeout(void)
 	CHECK(vqueue.pending == 1);
 	CHECK(!memcmp(user_tlv, "\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc",
 		      sizeof(user_tlv)));
-	CHECK(allocation_contains(vqueue.cookies[0],
+	CHECK(message_owns_payload(vqueue.cookies[0],
 				  vqueue.descs[0][2].address,
 				  vqueue.descs[0][2].length));
 	device_touch_late(&vqueue, true);
 	CHECK(vqueue.pending == 0);
 	CHECK(response_payload_owned);
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 
 	active_test = "tlv-read-interrupted-user-buffer-unchanged";
 	reset_fixture(&snd, &vdev, &vqueue);
@@ -511,12 +619,12 @@ static void test_tlv_read_success_and_owned_timeout(void)
 	CHECK(vqueue.pending == 1);
 	CHECK(!memcmp(user_tlv, "\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc",
 		      sizeof(user_tlv)));
-	CHECK(allocation_contains(vqueue.cookies[0],
+	CHECK(message_owns_payload(vqueue.cookies[0],
 				  vqueue.descs[0][2].address,
 				  vqueue.descs[0][2].length));
 	device_touch_late(&vqueue, true);
 	CHECK(response_payload_owned);
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 }
 
 static void test_tlv_write_copyin_timeout_and_interruption(void)
@@ -546,7 +654,7 @@ static void test_tlv_write_copyin_timeout_and_interruption(void)
 	CHECK(vqueue.nouts[0] == 2 && vqueue.nins[0] == 1);
 	CHECK(vqueue.descs[0][1].length == sizeof(input));
 	CHECK(vqueue.pending == 0);
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 
 	active_test = "tlv-write-interrupted-late-device-read";
 	reset_fixture(&snd, &vdev, &vqueue);
@@ -558,10 +666,10 @@ static void test_tlv_write_copyin_timeout_and_interruption(void)
 	CHECK(vqueue.pending == 1);
 	CHECK(vqueue.nouts[0] == 2 && vqueue.nins[0] == 1);
 	CHECK(vqueue.descs[0][1].length == sizeof(input));
-	CHECK(allocation_contains(vqueue.cookies[0],
+	CHECK(message_owns_payload(vqueue.cookies[0],
 				  vqueue.descs[0][1].address, sizeof(input)));
 	device_touch_late(&vqueue, false);
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 
 	active_test = "tlv-write-timeout-user-buffer-reuse";
 	reset_fixture(&snd, &vdev, &vqueue);
@@ -571,12 +679,12 @@ static void test_tlv_write_copyin_timeout_and_interruption(void)
 	CHECK(vqueue.pending == 1);
 	CHECK(vqueue.nouts[0] == 2 && vqueue.nins[0] == 1);
 	CHECK(vqueue.descs[0][1].length == sizeof(input));
-	CHECK(allocation_contains(vqueue.cookies[0],
+	CHECK(message_owns_payload(vqueue.cookies[0],
 				  vqueue.descs[0][1].address, sizeof(input)));
 	memset(input, 0xee, sizeof(input));
 	CHECK(!memcmp(vqueue.descs[0][1].address, original, sizeof(original)));
 	device_touch_late(&vqueue, false);
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 }
 
 static void test_tlv_command_timeout_next_operation(void)
@@ -597,12 +705,12 @@ static void test_tlv_command_timeout_next_operation(void)
 	CHECK(vqueue.pending == 1);
 	CHECK(vqueue.nouts[0] == 2 && vqueue.nins[0] == 1);
 	device_touch_late(&vqueue, false);
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 	wait_behavior = WAIT_SUCCESS;
 	CHECK(virtsnd_kctl_tlv_op(&control, SNDRV_CTL_TLV_OP_CMD,
 				  sizeof(input), (unsigned int *)input) == 0);
 	CHECK(vqueue.pending == 0);
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 }
 
 static void test_query_info_success_timeout_and_bounds(void)
@@ -624,7 +732,7 @@ static void test_query_info_success_timeout_and_bounds(void)
 	CHECK(info[0] == response_fill && info[11] == response_fill + 11);
 	CHECK(vqueue.nouts[0] == 1 && vqueue.nins[0] == 2);
 	CHECK(vqueue.descs[0][2].length == sizeof(info));
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 
 	active_test = "query-info-timeout-late-dma-after-dest-free";
 	reset_fixture(&snd, &vdev, &vqueue);
@@ -634,13 +742,13 @@ static void test_query_info_success_timeout_and_bounds(void)
 	rc = virtsnd_ctl_query_info(&snd, VIRTIO_SND_R_CTL_INFO, 0, 3, 4,
 				    expired_info);
 	CHECK(rc == -ETIMEDOUT);
-	CHECK(allocation_contains(vqueue.cookies[0],
+	CHECK(message_owns_payload(vqueue.cookies[0],
 				  vqueue.descs[0][2].address,
 				  vqueue.descs[0][2].length));
 	free(expired_info);
 	device_touch_late(&vqueue, true);
 	CHECK(response_payload_owned);
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 
 	active_test = "query-info-reject-invalid-sizes-before-queue";
 	reset_fixture(&snd, &vdev, &vqueue);
@@ -653,13 +761,13 @@ static void test_query_info_success_timeout_and_bounds(void)
 	CHECK(virtsnd_ctl_query_info(&snd, VIRTIO_SND_R_CTL_INFO, 0, 1, 4,
 				     NULL) == -EINVAL);
 	CHECK(vqueue.pending == 0);
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 	CHECK(virtsnd_ctl_msg_alloc(0, sizeof(struct virtio_snd_hdr), 0, 0,
 				    GFP_KERNEL) == NULL);
 	CHECK(virtsnd_ctl_msg_alloc(sizeof(struct virtio_snd_hdr),
 				    sizeof(struct virtio_snd_hdr), 0,
 				    (size_t)UINT_MAX + 1, GFP_KERNEL) == NULL);
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 }
 
 static void test_enum_items_copyout_and_timeout(void)
@@ -687,7 +795,7 @@ static void test_enum_items_copyout_and_timeout(void)
 	CHECK(response_payload_owned);
 	free(kctls[0].items);
 	kctls[0].items = NULL;
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 
 	active_test = "enum-items-timeout-output-unchanged-late-dma";
 	reset_fixture(&snd, &vdev, &vqueue);
@@ -699,7 +807,7 @@ static void test_enum_items_copyout_and_timeout(void)
 	CHECK(rc == -ETIMEDOUT);
 	CHECK(kctls[0].items != NULL);
 	CHECK(kctls[0].items[0].item_id == 0);
-	CHECK(allocation_contains(vqueue.cookies[0],
+	CHECK(message_owns_payload(vqueue.cookies[0],
 				  vqueue.descs[0][2].address,
 				  vqueue.descs[0][2].length));
 	device_touch_late(&vqueue, true);
@@ -707,7 +815,7 @@ static void test_enum_items_copyout_and_timeout(void)
 	CHECK(response_payload_owned);
 	free(kctls[0].items);
 	kctls[0].items = NULL;
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 
 	active_test = "enum-items-count-size-bounds";
 	reset_fixture(&snd, &vdev, &vqueue);
@@ -716,7 +824,7 @@ static void test_enum_items_copyout_and_timeout(void)
 	snd.kctls = kctls;
 	CHECK(virtsnd_kctl_get_enum_items(&snd, 0) == -EOVERFLOW);
 	CHECK(vqueue.pending == 0);
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 }
 
 static void test_retained_queue_bound_and_reset_cleanup(void)
@@ -737,13 +845,13 @@ static void test_retained_queue_bound_and_reset_cleanup(void)
 					  sizeof(input), (unsigned int *)input) ==
 		      -ETIMEDOUT);
 	CHECK(vqueue.pending == 8);
-	CHECK(live_messages == 8);
-	bounded_messages = live_messages;
+	CHECK(live_allocations == 16);
+	bounded_messages = live_allocations;
 	bounded_bytes = live_bytes;
 	CHECK(virtsnd_kctl_tlv_op(&control, SNDRV_CTL_TLV_OP_WRITE,
 				  sizeof(input), (unsigned int *)input) == -ENOSPC);
 	CHECK(vqueue.pending == 8);
-	CHECK(live_messages == bounded_messages);
+	CHECK(live_allocations == bounded_messages);
 	CHECK(live_bytes == bounded_bytes);
 
 	virtsnd_ctl_msg_cancel_all(&snd);
@@ -752,10 +860,10 @@ static void test_retained_queue_bound_and_reset_cleanup(void)
 	vqueue.pending = 0;
 	virtsnd_ctl_msg_cleanup(&snd);
 	CHECK(list_empty(&snd.ctl_msgs));
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 	virtsnd_ctl_msg_cleanup(&snd);
 	CHECK(list_empty(&snd.ctl_msgs));
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 	CHECK(message_allocations == message_frees);
 	virtsnd_ctl_msg_enable(&snd);
 	CHECK(!snd.ctl_msgs_blocked);
@@ -763,7 +871,7 @@ static void test_retained_queue_bound_and_reset_cleanup(void)
 	CHECK(virtsnd_kctl_tlv_op(&control, SNDRV_CTL_TLV_OP_WRITE,
 				  sizeof(input), (unsigned int *)input) == 0);
 	CHECK(vqueue.pending == 0);
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 	CHECK(message_allocations == message_frees);
 }
 
@@ -775,23 +883,30 @@ static void test_control_allocation_failure_then_recovery(void)
 	struct snd_kcontrol control = { .private_value = 43 };
 	unsigned char input[8] = { 2, 4, 6, 8, 10, 12, 14, 16 };
 
-	active_test = "message-allocation-failure-no-queue-leak";
-	reset_fixture(&snd, &vdev, &vqueue);
-	control.chip = &snd;
-	fail_next_message_allocation = true;
-	CHECK(virtsnd_kctl_tlv_op(&control, SNDRV_CTL_TLV_OP_WRITE,
-				  sizeof(input), (unsigned int *)input) == -ENOMEM);
-	CHECK(vqueue.pending == 0);
-	CHECK(list_empty(&snd.ctl_msgs));
-	CHECK(live_messages == 0);
+	for (unsigned int stage = 1; stage <= 2; ++stage) {
+		active_test = stage == 1 ? "metadata-allocation-failure-no-leak" :
+			"dma-buffer-allocation-failure-unwinds-metadata";
+		reset_fixture(&snd, &vdev, &vqueue);
+		control.chip = &snd;
+		fail_kzalloc_at = stage;
+		CHECK(virtsnd_kctl_tlv_op(&control, SNDRV_CTL_TLV_OP_WRITE,
+					  sizeof(input), (unsigned int *)input) ==
+		      -ENOMEM);
+		CHECK(vqueue.pending == 0);
+		CHECK(list_empty(&snd.ctl_msgs));
+		CHECK(live_allocations == 0);
+		CHECK(message_allocations == message_frees);
+	}
 
 	active_test = "message-allocation-recovery-next-normal-operation";
+	reset_fixture(&snd, &vdev, &vqueue);
+	control.chip = &snd;
 	wait_behavior = WAIT_SUCCESS;
 	CHECK(virtsnd_kctl_tlv_op(&control, SNDRV_CTL_TLV_OP_WRITE,
 				  sizeof(input), (unsigned int *)input) == 0);
 	CHECK(vqueue.pending == 0);
 	CHECK(list_empty(&snd.ctl_msgs));
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
 	CHECK(message_allocations == message_frees);
 }
 
@@ -810,16 +925,78 @@ static void test_cancel_keeps_queue_ref_for_late_callback(void)
 	CHECK(msg != NULL);
 	CHECK(virtsnd_ctl_msg_send(&snd, msg, false) == -ETIMEDOUT);
 	CHECK(vqueue.pending == 1);
-	CHECK(live_messages == 1);
+	CHECK(live_allocations == 2);
 	virtsnd_ctl_msg_cancel_all(&snd);
 	CHECK(snd.ctl_msgs_blocked);
 	CHECK(!list_empty(&snd.ctl_msgs));
-	CHECK(live_messages == 1);
+	CHECK(live_allocations == 2);
 	device_touch_late(&vqueue, true);
 	CHECK(list_empty(&snd.ctl_msgs));
 	CHECK(vqueue.pending == 0);
 	CHECK(response_payload_owned);
-	CHECK(live_messages == 0);
+	CHECK(live_allocations == 0);
+}
+#endif
+
+#ifdef TEST_LAYOUT_REGRESSION
+static bool v1_layout_has_cacheline_violation(struct virtio_snd_msg *msg,
+						      size_t alignment)
+{
+	struct scatterlist *segments[] = {
+		&msg->sg_request,
+		&msg->sg_response,
+		&msg->sg_request_data,
+		&msg->sg_response_data,
+	};
+	uintptr_t starts[ARRAY_SIZE(segments)];
+	uintptr_t ends[ARRAY_SIZE(segments)];
+	uintptr_t metadata_start = (uintptr_t)msg;
+	uintptr_t metadata_end = cacheline_end(metadata_start + sizeof(*msg),
+					       alignment);
+	unsigned int region_count = 0;
+
+	metadata_start -= metadata_start % alignment;
+	for (unsigned int i = 0; i < ARRAY_SIZE(segments); ++i) {
+		uintptr_t start;
+		uintptr_t end;
+
+		if (!segments[i]->length)
+			continue;
+
+		start = (uintptr_t)segments[i]->address;
+		end = cacheline_end(start + segments[i]->length, alignment);
+		if (!allocation_contains(msg, (void *)start, segments[i]->length))
+			return false;
+		if (start % alignment ||
+		    (start < metadata_end && end > metadata_start))
+			return true;
+		for (unsigned int j = 0; j < region_count; ++j)
+			if (end > starts[j] && start < ends[j])
+				return true;
+		starts[region_count] = start;
+		ends[region_count] = end;
+		++region_count;
+	}
+
+	return false;
+}
+
+static void test_v1_layout_cacheline_regression(void)
+{
+	struct virtio_snd_msg *msg;
+	static const unsigned int alignments[] = { 64, 128 };
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(alignments); ++i) {
+		active_test = "v1-packed-layout-violates-cacheline-isolation";
+		test_dma_cache_alignment = alignments[i];
+		msg = virtsnd_ctl_msg_alloc(13, 7, 35, 130, GFP_KERNEL);
+		CHECK(msg != NULL);
+		if (!msg)
+			continue;
+		CHECK(v1_layout_has_cacheline_violation(msg, alignments[i]));
+		virtsnd_ctl_msg_unref(msg);
+		CHECK(live_allocations == 0);
+	}
 }
 #endif
 
@@ -832,9 +1009,21 @@ int main(int argc, char **argv)
 	}
 	expect_baseline_uaf(argv[1]);
 	return 0;
+#elif defined(TEST_LAYOUT_REGRESSION)
+	(void)argc;
+	(void)argv;
+	test_v1_layout_cacheline_regression();
+	if (failures) {
+		fprintf(stderr, "RESULT FAIL assertions=%u failures=%u\n",
+			assertions, failures);
+		return 1;
+	}
+	printf("RESULT PASS assertions=%u\n", assertions);
+	return 0;
 #else
 	(void)argc;
 	(void)argv;
+	test_dma_layout_cacheline_alignments();
 	test_tlv_read_success_and_owned_timeout();
 	test_tlv_write_copyin_timeout_and_interruption();
 	test_tlv_command_timeout_next_operation();

@@ -1,7 +1,7 @@
 # Virtio-snd source-only reproducer
 
 This package runs host-side ASan and UBSan regressions against source extracted from a Linux Git worktree.
-It contains five signed patches and the host test harnesses, but no kernel or QEMU build, audio samples, or private lab logs.
+It contains five signed v1 patches, a separate v2 review overlay, and the host test harnesses, but no kernel or QEMU build, audio samples, or private lab logs.
 
 ## Requirements
 
@@ -26,9 +26,12 @@ git -C "$VIRTIO_SND_KERNEL" fetch --no-tags origin "$VIRTIO_SND_BASE"
 git -C "$VIRTIO_SND_KERNEL" checkout --detach FETCH_HEAD
 test "$(git -C "$VIRTIO_SND_KERNEL" rev-parse HEAD)" = "$VIRTIO_SND_BASE"
 git -C "$VIRTIO_SND_KERNEL" am "$VIRTIO_SND_REPRO"/kernel-patches/*.patch
+git -C "$VIRTIO_SND_KERNEL" apply "$VIRTIO_SND_REPRO"/kernel-patches/review-v2.diff
 
 python3 "$VIRTIO_SND_REPRO"/tests/run_host_tests.py \
   --kernel-tree "$VIRTIO_SND_KERNEL" \
+  --ack-baseline-ref HEAD \
+  --nommu-baseline-ref HEAD \
   --output-dir /tmp/virtio-snd-reproducer-results
 ```
 
@@ -37,6 +40,10 @@ The generic regressions use `HEAD~5` as the pre-series baseline.
 The DMA and control-payload lifetime checks use `HEAD~2`, after patches 1 through 3 and before patches 4 and 5.
 These ancestry-based defaults work even when `git am` creates different commit hashes.
 Pass `--generic-baseline-ref` and `--lifetime-baseline-ref` to override them when the commit layout differs.
+The PCM ACK regression compares the working-tree v2 source with the v1 source at `HEAD` after the five mail patches are applied.
+Pass `--ack-baseline-ref` when the pre-fix source is stored at another ref.
+The NOMMU lifetime regression also compares the working tree with v1 at `HEAD` in the packaged workflow.
+Pass `--nommu-baseline-ref` when that source is stored at another ref.
 
 Run the host suite from any current directory; generated C files and executables live in temporary storage.
 Logs and optional JSON source-hash manifests go only to the supplied `--output-dir`.
@@ -48,12 +55,14 @@ Extracted kernel function and type definitions are copied byte-for-byte from the
 The pre-patch baseline is expected to fail selected generic assertions and report AddressSanitizer use-after-free errors.
 The runners check these baseline failures explicitly; they are reproduced defects, not a failed run.
 The patched candidate must pass every host harness, and the aggregate runner must print `HOST_REPRODUCER_PASS`.
+The ACK baseline is expected to produce four failure assertions across playback and capture; the candidate checks that send errors fail-stop without committing indirect state, then accepts another ACK after modeled cleanup and prepare.
 
-On the validated source state, the candidate harnesses report 143 generic assertions, 68 DMA lifetime assertions, and 129 control-payload assertions, for 340 passing assertions total.
-The generic marker lines are `RESULT PASS assertions=90`, `RESULT PASS assertions=44`, and `RESULT PASS assertions=9`.
-The lifetime markers are `RESULT PASS assertions=68` and `RESULT PASS assertions=129`.
+On the current v2 source state, the candidate markers report 95 PCM assertions, 44 control lifetime assertions, 129 remove/freeze assertions, 80 DMA assertions, 232 control-payload assertions, 6 v1 layout assertions, and 525 NOMMU lifetime assertions.
+The ACK candidate also passes its playback, capture, fail-stop, and recovery checks after the baseline reproduces four expected failures.
+The ACK harness also checks callback suppression after the first error and 64-bit appl_ptr rollover using the exact extracted ALSA indirect-transfer helpers.
+Its RELEASE/prepare recovery sequence is modeled by the harness; it does not execute the production ALSA sync_stop/prepare callbacks or a virtio device reset.
 
-The host package was run from an unrelated directory on macOS arm64 with Apple Clang 21.0.0 and on Debian Linux aarch64 with GCC 14.2.0.
+The v2 host suite passed on macOS arm64 with Apple Clang 21.0.0 and Debian Linux aarch64 with GCC 14.2.0.
 These are host harness results; they do not build or boot a kernel or execute a virtio transport.
 See [qemu/README.md](qemu/README.md) for the separate KASAN guest source fixture and its build/run recipe.
 
@@ -61,7 +70,9 @@ See [qemu/README.md](qemu/README.md) for the separate KASAN guest source fixture
 
 `kernel-patches/series` records patch order.
 The five `.patch` files preserve their original mail headers, bodies, authorship, and `Signed-off-by` lines.
-`kernel-patches/SHA256SUMS` records their package hashes.
+`kernel-patches/review-v2.diff` is a separate local review overlay applied after those five patches; it is not part of the signed v1 mail series.
+`kernel-patches/SHA256SUMS` records the five v1 mail patch hashes.
+`kernel-patches/review-v2.sha256` records the separate review overlay hash.
 
 Linux source is read from the caller-supplied worktree at run time and remains governed by its upstream license.
 The host test harnesses and runner scripts use GPL-2.0-only; see [COPYING](COPYING).

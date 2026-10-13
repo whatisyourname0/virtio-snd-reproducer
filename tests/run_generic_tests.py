@@ -24,6 +24,10 @@ CTL_MARKER = "/* EXTRACTED_VIRTSND_CTL_FUNCTIONS */"
 REMOVE_MARKER = "/* EXTRACTED_VIRTSND_REMOVE */"
 BASELINE_DEFAULT = "HEAD~5"
 EXPECTED_BASELINE_FAILURES = {
+    "capture-length-clamp": (
+        "fixture.vss.hw_ptr == 64",
+        "ratelimited_errors == 1",
+    ),
     "partial-send": (
         "vqueue->kicks == 1",
         "fixture.messages[1].length == 0",
@@ -82,8 +86,12 @@ OPTIONAL_CTL_FUNCTIONS = (
     ("sound/virtio/virtio_ctl_msg.c", "virtsnd_ctl_msg_cleanup"),
     ("sound/virtio/virtio_ctl_msg.c", "virtsnd_ctl_msg_enable"),
 )
+OPTIONAL_REMOVE_FUNCTIONS = (
+    ("sound/virtio/virtio_card.c", "virtsnd_reset_vqs"),
+)
 REQUIRED_REMOVE_FUNCTIONS = (
     ("sound/virtio/virtio_card.c", "virtsnd_remove"),
+    ("sound/virtio/virtio_card.c", "virtsnd_freeze"),
 )
 
 
@@ -203,9 +211,11 @@ def compile_and_run(
     generated = temp / f"{label}-lifetime-tests.c"
     binary = temp / f"{label}-lifetime-tests"
     extracted = "\n\n".join(source_blocks)
-    prefix = ""
+    prefix = "#define CONFIG_MMU 1\n"
+    if any("static void virtsnd_reset_vqs(" in block for block in source_blocks):
+        prefix += "#define VIRTSND_RESET_VQS_AVAILABLE 1\n"
     if candidate_ctl:
-        prefix = (
+        prefix += (
             "#define VIRTSND_CTL_TEARDOWN_AVAILABLE 1\n"
             "#define VIRTSND_CTL_NEW_SEND_API 1\n"
         )
@@ -305,13 +315,13 @@ def main() -> int:
         baseline_sources,
         require_optional=False,
         required=REQUIRED_REMOVE_FUNCTIONS,
-        optional=(),
+        optional=OPTIONAL_REMOVE_FUNCTIONS,
     )
     candidate_remove_blocks, candidate_remove_functions = extract_set(
         candidate_sources,
         require_optional=False,
         required=REQUIRED_REMOVE_FUNCTIONS,
-        optional=(),
+        optional=OPTIONAL_REMOVE_FUNCTIONS,
     )
 
     candidate_hashes = {

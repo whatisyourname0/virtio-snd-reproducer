@@ -19,6 +19,7 @@ LAB = Path(__file__).resolve().parent
 DMA_HARNESS = LAB / "virtio_snd_dma_lifetime_harness.c"
 CTL_HARNESS = LAB / "virtio_snd_payload_lifetime_harness.c"
 BASELINE_DEFAULT = "HEAD~2"
+V1_CONTROL_REF = "HEAD"
 
 DMA_FILES = (
     "sound/virtio/virtio_pcm_msg.c",
@@ -40,11 +41,13 @@ DMA_FUNCTIONS = (
     ("sound/virtio/virtio_pcm_msg.c", "virtsnd_pcm_msg_send"),
     ("sound/virtio/virtio_pcm_msg.c", "virtsnd_pcm_msg_pending_num"),
     ("sound/virtio/virtio_pcm_msg.c", "virtsnd_pcm_msg_complete"),
+    ("sound/virtio/virtio_pcm_msg.c", "virtsnd_pcm_msg_cancel"),
     ("sound/virtio/virtio_pcm_ops.c", "virtsnd_pcm_sync_stop"),
     ("sound/virtio/virtio_pcm_ops.c", "virtsnd_pcm_hw_free"),
     ("sound/core/pcm_native.c", "do_hw_free"),
 )
 CTL_FUNCTIONS = (
+    ("sound/virtio/virtio_ctl_msg.c", "virtsnd_ctl_msg_sg_init"),
     ("sound/virtio/virtio_ctl_msg.c", "virtsnd_ctl_msg_ref"),
     ("sound/virtio/virtio_ctl_msg.c", "virtsnd_ctl_msg_unref"),
     ("sound/virtio/virtio_ctl_msg.c", "virtsnd_ctl_msg_request"),
@@ -239,6 +242,7 @@ def main() -> int:
     baseline_dma = load_sources(tree, DMA_FILES, args.baseline_ref)
     candidate_dma = load_sources(tree, DMA_FILES, None)
     baseline_ctl = load_sources(tree, CTL_FILES, args.baseline_ref)
+    v1_ctl = load_sources(tree, CTL_FILES, V1_CONTROL_REF)
     candidate_ctl = load_sources(tree, CTL_FILES, None)
 
     dma_structs = ("virtio_pcm_msg", "virtio_pcm_substream")
@@ -253,7 +257,8 @@ def main() -> int:
             type_block(baseline_dma["sound/virtio/virtio_pcm.h"], dma_structs[1]),
             *functions_in_order(baseline_dma, DMA_FUNCTIONS,
                                 optional=frozenset({"virtsnd_pcm_dma_pages_put",
-                                                    "virtsnd_pcm_dma_pages_get"})),
+                                                    "virtsnd_pcm_dma_pages_get",
+                                                    "virtsnd_pcm_msg_cancel"})),
         ]
         candidate_dma_blocks = [
             type_block(candidate_dma["sound/virtio/virtio_pcm_msg.c"], dma_structs[0]),
@@ -264,7 +269,17 @@ def main() -> int:
         baseline_ctl_blocks = [
             type_block(baseline_ctl["sound/virtio/virtio_ctl_msg.c"], ctl_structs[0]),
             *functions_in_order(baseline_ctl, CTL_FUNCTIONS,
-                                optional=frozenset({"virtsnd_ctl_msg_request_data",
+                                optional=frozenset({"virtsnd_ctl_msg_sg_init",
+                                                    "virtsnd_ctl_msg_request_data",
+                                                    "virtsnd_ctl_msg_response_data",
+                                                    "virtsnd_ctl_msg_cleanup",
+                                                    "virtsnd_ctl_msg_enable"})),
+        ]
+        v1_ctl_blocks = [
+            type_block(v1_ctl["sound/virtio/virtio_ctl_msg.c"], ctl_structs[0]),
+            *functions_in_order(v1_ctl, CTL_FUNCTIONS,
+                                optional=frozenset({"virtsnd_ctl_msg_sg_init",
+                                                    "virtsnd_ctl_msg_request_data",
                                                     "virtsnd_ctl_msg_response_data",
                                                     "virtsnd_ctl_msg_cleanup",
                                                     "virtsnd_ctl_msg_enable"})),
@@ -276,15 +291,21 @@ def main() -> int:
 
         baseline_dma_c = compose(
             DMA_HARNESS, "/* EXTRACTED_DMA_FUNCTIONS */", baseline_dma_blocks,
-            temp / "baseline-dma.c", ("#define TEST_BASELINE 1",),
+            temp / "baseline-dma.c",
+            ("#define TEST_BASELINE 1", "#define CONFIG_MMU 1"),
         )
         candidate_dma_c = compose(
             DMA_HARNESS, "/* EXTRACTED_DMA_FUNCTIONS */", candidate_dma_blocks,
-            temp / "candidate-dma.c", ("#define TEST_CANDIDATE 1",),
+            temp / "candidate-dma.c",
+            ("#define TEST_CANDIDATE 1", "#define CONFIG_MMU 1"),
         )
         baseline_ctl_c = compose(
             CTL_HARNESS, "/* EXTRACTED_CONTROL_FUNCTIONS */", baseline_ctl_blocks,
             temp / "baseline-control.c", ("#define TEST_BASELINE 1",),
+        )
+        v1_ctl_c = compose(
+            CTL_HARNESS, "/* EXTRACTED_CONTROL_FUNCTIONS */", v1_ctl_blocks,
+            temp / "v1-control-layout.c", ("#define TEST_LAYOUT_REGRESSION 1",),
         )
         candidate_ctl_c = compose(
             CTL_HARNESS, "/* EXTRACTED_CONTROL_FUNCTIONS */", candidate_ctl_blocks,
@@ -292,9 +313,10 @@ def main() -> int:
         )
 
         binaries = [temp / "baseline-dma", temp / "candidate-dma",
-                    temp / "baseline-control", temp / "candidate-control"]
+                    temp / "baseline-control", temp / "candidate-control",
+                    temp / "v1-control-layout"]
         for source, binary in zip((baseline_dma_c, candidate_dma_c,
-                                   baseline_ctl_c, candidate_ctl_c), binaries):
+                                   baseline_ctl_c, candidate_ctl_c, v1_ctl_c), binaries):
             compile_binary(cc, source, binary)
 
         run(binaries[0], "late-capture", expect_uaf=True)
@@ -304,6 +326,7 @@ def main() -> int:
         run(binaries[2], "query-info", expect_uaf=True)
         dma_output = run(binaries[1], "all")
         ctl_output = run(binaries[3], "all")
+        v1_layout_output = run(binaries[4])
 
     hashes_after = {
         relative: hashlib.sha256((tree / relative).read_bytes()).hexdigest()
@@ -316,6 +339,8 @@ def main() -> int:
         "source_tree": str(tree),
         "baseline_ref": args.baseline_ref,
         "baseline_commit": baseline_commit,
+        "v1_control_layout_ref": V1_CONTROL_REF,
+        "v1_control_layout_commit": resolve_commit(tree, V1_CONTROL_REF),
         "kernel_built_or_booted": False,
         "host_shims_model_vmalloc_backing_and_virtqueue_dma": True,
         "baseline_expected_uaf_cases": [
@@ -323,6 +348,9 @@ def main() -> int:
         ],
         "candidate_dma_assertions": re.search(r"RESULT PASS assertions=(\d+)", dma_output).group(1),
         "candidate_control_assertions": re.search(r"RESULT PASS assertions=(\d+)", ctl_output).group(1),
+        "v1_layout_regression_assertions": re.search(
+            r"RESULT PASS assertions=(\d+)", v1_layout_output).group(1),
+        "v1_layout_regression": "packed layout violates 64-byte and 128-byte cacheline isolation",
         "source_sha256": hashes_after,
         "source_unchanged_during_run": True,
         "sanitizers": ["address", "undefined"],

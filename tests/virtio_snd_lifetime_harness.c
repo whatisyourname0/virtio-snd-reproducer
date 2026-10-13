@@ -42,6 +42,8 @@ typedef unsigned long snd_pcm_uframes_t;
 #define SNDRV_PCM_HW_PARAM_PERIODS 1
 #define SNDRV_PCM_FORMAT_S16_LE 2
 #define fallthrough __attribute__((fallthrough))
+#define min_t(type, left, right) ((type)(left) < (type)(right) ? \
+				      (type)(left) : (type)(right))
 #define guard(type) test_guard_##type
 #define scoped_guard(type, lock) \
 	for (unsigned int __guard_once = ((void)(lock), 1U); \
@@ -52,6 +54,10 @@ typedef unsigned long snd_pcm_uframes_t;
 	((void)(wait), (void)(timeout), (condition) ? 1L : 0L)
 #define dev_err(device, ...) ((void)(device))
 #define dev_warn(device, ...) ((void)(device))
+#define dev_err_ratelimited(device, ...) do { \
+	(void)(device); \
+	ratelimited_errors++; \
+} while (0)
 
 struct device { unsigned int unused; };
 struct virtio_device { struct device dev; };
@@ -174,6 +180,7 @@ static unsigned int cancel_work_calls;
 static unsigned int pcm_dev_set_params_calls;
 static unsigned int pcm_msg_alloc_calls;
 static unsigned int ctl_free_calls;
+static unsigned int ratelimited_errors;
 static long ctl_wait_result;
 static const char *active_test;
 
@@ -575,7 +582,25 @@ static void reset_faults(void)
 	pcm_dev_set_params_calls = 0;
 	pcm_msg_alloc_calls = 0;
 	ctl_free_calls = 0;
+	ratelimited_errors = 0;
 	ctl_wait_result = 0;
+}
+
+static void test_capture_completion_clamps_reported_length(void)
+{
+	struct fixture fixture;
+
+	active_test = "capture-length-clamp";
+	fixture_init(&fixture);
+	fixture.vss.msg_count = 1;
+	fixture.messages[0].length = 64;
+	virtsnd_pcm_msg_complete(&fixture.messages[0],
+				 sizeof(fixture.messages[0].status) + 80);
+	CHECK(fixture.vss.hw_ptr == 64);
+	CHECK(fixture.messages[0].length == 0);
+	CHECK(fixture.vss.msg_count == 0);
+	CHECK(fixture.vss.msg_empty.wakes == 1);
+	CHECK(ratelimited_errors == 1);
 }
 
 static void test_partial_queue_add_failure_kicks_prefix_and_recovers(void)
@@ -801,6 +826,8 @@ static void test_idle_sync_stop_quiesces_work_without_release(void)
 
 int main(void)
 {
+	reset_faults();
+	test_capture_completion_clamps_reported_length();
 	reset_faults();
 	test_partial_queue_add_failure_kicks_prefix_and_recovers();
 	reset_faults();

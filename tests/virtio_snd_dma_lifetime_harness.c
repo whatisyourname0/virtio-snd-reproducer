@@ -29,6 +29,9 @@ typedef int wait_queue_head_t;
 #define VIRTIO_SND_R_PCM_RELEASE 0x0206U
 #define cpu_to_le32(value) ((u32)(value))
 #define le32_to_cpu(value) ((u32)(value))
+#define min_t(type, left, right) ((type)(left) < (type)(right) ? \
+				      (type)(left) : (type)(right))
+#define WARN_ON_ONCE(condition) test_warn_on(condition)
 #define guard(type) test_guard_##type
 #define scoped_guard(type, lock) \
 	for (unsigned int __guard_once = ((void)(lock), 1U); \
@@ -120,7 +123,20 @@ static long bytes_to_frames(struct snd_pcm_runtime *runtime, unsigned int bytes)
 	(void)runtime;
 	return bytes;
 }
-static void wake_up_all(wait_queue_head_t *queue) { (void)queue; }
+static unsigned int test_wakes;
+static unsigned int test_warnings;
+static unsigned int test_ratelimited_errors;
+static bool test_warn_on(bool condition)
+{
+	if (condition)
+		test_warnings++;
+	return condition;
+}
+static void wake_up_all(wait_queue_head_t *queue)
+{
+	(void)queue;
+	test_wakes++;
+}
 static unsigned int virtsnd_msg_timeout_ms = 1;
 static unsigned int msecs_to_jiffies(unsigned int milliseconds)
 {
@@ -159,6 +175,12 @@ static void dev_warn(const void *device, const char *format, ...)
 {
 	(void)device;
 	(void)format;
+}
+static void dev_err_ratelimited(const void *device, const char *format, ...)
+{
+	(void)device;
+	(void)format;
+	test_ratelimited_errors++;
 }
 
 static unsigned char *test_vmap;
@@ -374,6 +396,9 @@ static void test_fixture_init(struct virtio_pcm_substream *vss,
 	test_alloc_calls = 0;
 	test_fail_alloc_at = 0;
 	test_wait_result = 0;
+	test_wakes = 0;
+	test_warnings = 0;
+	test_ratelimited_errors = 0;
 	release_result = 0;
 	substream->runtime = runtime;
 	substream->ops = ops;
@@ -661,6 +686,40 @@ static void test_page_pin_released_only_after_free(void)
 	CHECK(test_puts == 2);
 	test_pages_dispose();
 }
+
+static void test_reset_cancel_retires_tokens_without_completion(void)
+{
+	struct virtio_pcm_substream vss = { 0 };
+	struct virtio_pcm_msg first = { 0 }, second = { 0 };
+	unsigned int scheduled = vss.elapsed_period.schedules;
+
+	active_test = "reset-cancel-pending-count-and-wakeup";
+	vss.msg_count = 2;
+	vss.xfer_enabled = true;
+	vss.hw_ptr = 17;
+	first.substream = &vss;
+	first.length = PAGE_SIZE;
+	second.substream = &vss;
+	second.length = PAGE_SIZE;
+	test_wakes = 0;
+	test_warnings = 0;
+
+	virtsnd_pcm_msg_cancel(&first);
+	CHECK(first.length == 0);
+	CHECK(vss.msg_count == 1);
+	CHECK(!vss.xfer_enabled);
+	CHECK(vss.hw_ptr == 17);
+	CHECK(vss.elapsed_period.schedules == scheduled);
+	CHECK(test_wakes == 0);
+
+	virtsnd_pcm_msg_cancel(&second);
+	CHECK(second.length == 0);
+	CHECK(vss.msg_count == 0);
+	CHECK(vss.hw_ptr == 17);
+	CHECK(vss.elapsed_period.schedules == scheduled);
+	CHECK(test_wakes == 1);
+	CHECK(test_warnings == 0);
+}
 #endif
 
 int main(int argc, char **argv)
@@ -680,6 +739,7 @@ int main(int argc, char **argv)
 	test_partial_alloc_and_repeated_free();
 	test_page_count_overflow_and_size_bounds();
 	test_page_pin_released_only_after_free();
+	test_reset_cancel_retires_tokens_without_completion();
 	if (failures) {
 		fprintf(stderr, "RESULT FAIL assertions=%u failures=%u\n",
 			assertions, failures);

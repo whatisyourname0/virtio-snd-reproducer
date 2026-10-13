@@ -37,6 +37,7 @@ qemu/scripts/build-qemu.sh \
 
 qemu/scripts/build-kasan-kernels.sh \
   --kernel-tree /path/to/linux-with-five-patch-series \
+  --candidate-overlay "$PWD/kernel-patches/review-v2.diff" \
   --output-dir "$out/kernels" \
   --jobs 2
 
@@ -53,12 +54,16 @@ python3 qemu/runtime/build_runtime_manifest.py \
 ```
 
 The baseline defaults to `HEAD~2`, which includes the base and patches 1–3.
-The candidate defaults to `HEAD`, which includes all five patches. The builder
-checks the original base hash and the two-commit distance between those refs.
-It records each resolved source commit and hashes the resulting image, driver,
-observer, module tree, and initramfs. QEMU source and patch hashes are recorded
-with the newly built QEMU binary; the binary hash is never pinned in this
-source package.
+The candidate defaults to `HEAD`, which includes all five patches.
+The optional `--candidate-overlay` is applied only to the candidate source
+after archive extraction; the baseline remains the clean `HEAD~2` archive.
+The builder checks the original base hash and the two-commit distance between
+those refs. It preserves the source archive hash, copies the overlay into the
+candidate output directory, and records the overlay SHA-256 in
+`kernel-build.json`. It also hashes the resulting image, driver, observer,
+module tree, and initramfs. QEMU source and patch hashes are recorded with the
+newly built QEMU binary; the binary hash is never pinned in this source
+package.
 
 `build-qemu.sh` downloads the official QEMU 11.1.2 source archive and verifies
 its SHA-256 before applying `qemu-test-backend.patch`. It invokes QEMU's
@@ -108,7 +113,8 @@ against a fresh upstream source extraction. The initramfs recipe was also run
 with existing candidate modules, and the resulting new initramfs passed the
 PCM boot, fault-injection, and recovery checks. The complete QEMU, Linux kernel,
 observer module, and initramfs source rebuild recipe has not been run end to
-end from this package.
+end from this package. Candidate overlay archive staging and strict patch
+application checks are validated separately without a kernel rebuild.
 
 ## License and source provenance
 
