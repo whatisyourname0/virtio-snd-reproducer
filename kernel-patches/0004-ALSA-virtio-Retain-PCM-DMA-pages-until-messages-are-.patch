@@ -1,0 +1,248 @@
+From 6b6421f719a49ce0195c3d43f58b50e40a6e9347 Mon Sep 17 00:00:00 2001
+Message-ID: <6b6421f719a49ce0195c3d43f58b50e40a6e9347.1791867377.git.mynameisjune111@gmail.com>
+In-Reply-To: <cover.1791867377.git.mynameisjune111@gmail.com>
+References: <cover.1791867377.git.mynameisjune111@gmail.com>
+From: Joonho Lee <mynameisjune111@gmail.com>
+Date: Tue, 13 Oct 2026 12:08:56 +0900
+Subject: [PATCH v1 4/5] ALSA: virtio: Retain PCM DMA pages until messages are
+ freed
+To: Anton Yakovlev <anton.yakovlev@opensynergy.com>,
+    Takashi Iwai <tiwai@suse.com>
+Cc: "Michael S. Tsirkin" <mst@redhat.com>,
+    Jaroslav Kysela <perex@perex.cz>,
+    virtualization@lists.linux.dev,
+    linux-sound@vger.kernel.org,
+    linux-kernel@vger.kernel.org
+
+PCM I/O scatterlists point directly into the ALSA runtime's vmalloc
+buffer. If RELEASE or queue draining times out, ALSA still frees that
+managed buffer during hw_free/close while the device may retain the
+queued descriptors. Keeping only the virtio_pcm_msg objects alive does
+not keep their backing pages allocated.
+
+Take a reference to each page backing the PCM buffer before building the
+I/O scatterlists, and release those references only when the messages
+are freed after device ownership ends. This keeps late device DMA away
+from pages that the allocator could otherwise reuse after ALSA releases
+the vmalloc mapping.
+
+Fixes: f40a28679e0b ("ALSA: virtio: handling control and I/O messages for the PCM device")
+Assisted-by: LLM
+Signed-off-by: Joonho Lee <mynameisjune111@gmail.com>
+---
+Validation: separate ARM64 W=1 module build at this commit. With the
+full series, delayed capture completion passed two KASAN/QEMU runs;
+the tree through patch 3 reproduced freed-page reads. Playback late
+access and allocation-failure paths also have ASan/UBSan shim tests.
+
+ sound/virtio/virtio_pcm.h     |   5 ++
+ sound/virtio/virtio_pcm_msg.c | 110 ++++++++++++++++++++++++++++++++--
+ sound/virtio/virtio_pcm_ops.c |   2 +
+ 3 files changed, 112 insertions(+), 5 deletions(-)
+
+diff --git a/sound/virtio/virtio_pcm.h b/sound/virtio/virtio_pcm.h
+index 8837dfc12828..56ac2769b05b 100644
+--- a/sound/virtio/virtio_pcm.h
++++ b/sound/virtio/virtio_pcm.h
+@@ -13,6 +13,7 @@
+ 
+ struct virtio_pcm;
+ struct virtio_pcm_msg;
++struct page;
+ 
+ /**
+  * struct virtio_pcm_substream - VirtIO PCM substream.
+@@ -38,6 +39,8 @@ struct virtio_pcm_msg;
+  * @msgs: Allocated I/O messages.
+  * @nmsgs: Number of allocated I/O messages.
+  * @msg_count: Number of pending I/O messages in the virtqueue.
++ * @dma_pages: Pages backing DMA messages, retained until messages are freed.
++ * @ndma_pages: Number of retained pages.
+  * @msg_empty: Notify when msg_count is zero.
+  */
+ struct virtio_pcm_substream {
+@@ -60,6 +63,8 @@ struct virtio_pcm_substream {
+ 	struct virtio_pcm_msg **msgs;
+ 	unsigned int nmsgs;
+ 	unsigned int msg_count;
++	struct page **dma_pages;
++	unsigned int ndma_pages;
+ 	wait_queue_head_t msg_empty;
+ };
+ 
+diff --git a/sound/virtio/virtio_pcm_msg.c b/sound/virtio/virtio_pcm_msg.c
+index 5371f4985fd0..46bf4df65974 100644
+--- a/sound/virtio/virtio_pcm_msg.c
++++ b/sound/virtio/virtio_pcm_msg.c
+@@ -3,6 +3,9 @@
+  * virtio-snd: Virtio sound device
+  * Copyright (C) 2021 OpenSynergy GmbH
+  */
++#include <linux/limits.h>
++#include <linux/mm.h>
++#include <linux/overflow.h>
+ #include <sound/pcm_params.h>
+ 
+ #include "virtio_card.h"
+@@ -75,6 +78,73 @@ static int virtsnd_pcm_sg_num(u8 *data, unsigned int length)
+ 	return num;
+ }
+ 
++/**
++ * virtsnd_pcm_dma_pages_put() - Release retained PCM buffer pages.
++ * @vss: VirtIO PCM substream.
++ *
++ * Context: Process context.
++ */
++static void virtsnd_pcm_dma_pages_put(struct virtio_pcm_substream *vss)
++{
++	while (vss->ndma_pages)
++		put_page(vss->dma_pages[--vss->ndma_pages]);
++	kfree(vss->dma_pages);
++	vss->dma_pages = NULL;
++}
++
++/**
++ * virtsnd_pcm_dma_pages_get() - Retain the pages backing the PCM buffer.
++ * @vss: VirtIO PCM substream.
++ * @data: PCM buffer address.
++ * @length: PCM buffer size.
++ *
++ * Keep the backing pages alive while virtqueue descriptors can still refer to
++ * them, even if ALSA releases the vmalloc mapping after a failed drain.
++ *
++ * Context: Process context.
++ * Return: 0 on success, -errno on failure.
++ */
++static int virtsnd_pcm_dma_pages_get(struct virtio_pcm_substream *vss,
++				     u8 *data, size_t length)
++{
++	size_t i;
++	size_t npages;
++	size_t span;
++
++	if (!data || !length || !is_vmalloc_addr(data))
++		return -EINVAL;
++	if (vss->dma_pages || vss->ndma_pages)
++		return -EBUSY;
++
++	if (check_add_overflow(length, (size_t)offset_in_page(data), &span))
++		return -EOVERFLOW;
++
++	npages = span / PAGE_SIZE + !!(span % PAGE_SIZE);
++	if (npages > UINT_MAX)
++		return -EOVERFLOW;
++
++	vss->dma_pages = kcalloc(npages, sizeof(*vss->dma_pages), GFP_KERNEL);
++	if (!vss->dma_pages)
++		return -ENOMEM;
++
++	for (i = 0; i < npages; i++) {
++		struct page *page = vmalloc_to_page(data + i * PAGE_SIZE);
++
++		if (!page)
++			goto err_put_pages;
++
++		get_page(page);
++		vss->dma_pages[vss->ndma_pages++] = page;
++	}
++
++	return 0;
++
++err_put_pages:
++	virtsnd_pcm_dma_pages_put(vss);
++
++	return -EINVAL;
++}
++
+ /**
+  * virtsnd_pcm_sg_from() - Build sg-list from vmalloc'ed buffer.
+  * @sgs: Preallocated sg-list to populate.
+@@ -133,22 +203,42 @@ int virtsnd_pcm_msg_alloc(struct virtio_pcm_substream *vss,
+ 			  unsigned int periods, unsigned int period_bytes)
+ {
+ 	struct snd_pcm_runtime *runtime = vss->substream->runtime;
++	size_t buffer_bytes;
+ 	unsigned int i;
++	int rc;
++
++	if (vss->msgs || vss->nmsgs || vss->dma_pages || vss->ndma_pages)
++		return -EBUSY;
++
++	if (check_mul_overflow((size_t)periods, (size_t)period_bytes,
++			       &buffer_bytes))
++		return -EOVERFLOW;
++
++	if (!runtime->dma_area || buffer_bytes > runtime->dma_bytes)
++		return -EINVAL;
++
++	rc = virtsnd_pcm_dma_pages_get(vss, runtime->dma_area, buffer_bytes);
++	if (rc)
++		return rc;
+ 
+ 	vss->msgs = kzalloc_objs(*vss->msgs, periods);
+-	if (!vss->msgs)
+-		return -ENOMEM;
++	if (!vss->msgs) {
++		rc = -ENOMEM;
++		goto err_free_pages;
++	}
+ 
+ 	vss->nmsgs = periods;
+ 
+ 	for (i = 0; i < periods; ++i) {
+-		u8 *data = runtime->dma_area + period_bytes * i;
++		u8 *data = runtime->dma_area + (size_t)period_bytes * i;
+ 		int sg_num = virtsnd_pcm_sg_num(data, period_bytes);
+ 		struct virtio_pcm_msg *msg;
+ 
+ 		msg = kzalloc_flex(*msg, sgs, sg_num + 2);
+-		if (!msg)
+-			return -ENOMEM;
++		if (!msg) {
++			rc = -ENOMEM;
++			goto err_free_msgs;
++		}
+ 
+ 		msg->substream = vss;
+ 		sg_init_one(&msg->sgs[PCM_MSG_SG_XFER], &msg->xfer,
+@@ -162,6 +252,15 @@ int virtsnd_pcm_msg_alloc(struct virtio_pcm_substream *vss,
+ 	}
+ 
+ 	return 0;
++
++err_free_msgs:
++	virtsnd_pcm_msg_free(vss);
++	return rc;
++
++err_free_pages:
++	virtsnd_pcm_dma_pages_put(vss);
++
++	return rc;
+ }
+ 
+ /**
+@@ -177,6 +276,7 @@ void virtsnd_pcm_msg_free(struct virtio_pcm_substream *vss)
+ 	for (i = 0; vss->msgs && i < vss->nmsgs; ++i)
+ 		kfree(vss->msgs[i]);
+ 	kfree(vss->msgs);
++	virtsnd_pcm_dma_pages_put(vss);
+ 
+ 	vss->msgs = NULL;
+ 	vss->nmsgs = 0;
+diff --git a/sound/virtio/virtio_pcm_ops.c b/sound/virtio/virtio_pcm_ops.c
+index f2362f0dd80a..82f2d2f9dd64 100644
+--- a/sound/virtio/virtio_pcm_ops.c
++++ b/sound/virtio/virtio_pcm_ops.c
+@@ -25,6 +25,8 @@
+  *   signal or due to a timeout. In this case, the device can still access
+  *   messages even after calling ops->hw_free(). It can also issue an interrupt,
+  *   and the interrupt handler will also try to access message structures.
++ *   The messages retain references to the PCM buffer pages until they are
++ *   freed, so late DMA does not target pages released by ALSA.
+  *
+  *   Therefore, freeing of already allocated messages occurs:
+  *
+-- 
+2.54.0 (Apple Git-157)
+

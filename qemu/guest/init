@@ -1,0 +1,28 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-only
+set -u
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+exec </dev/console >/dev/console 2>&1
+
+release=$(uname -r)
+modprobe -S "$release" snd
+modprobe -S "$release" snd_pcm
+modprobe -S "$release" virtio_snd
+if [ -s "/lib/modules/$release/extra/virtio_snd_lifetime_observer.ko" ]; then
+	insmod "/lib/modules/$release/extra/virtio_snd_lifetime_observer.ko"
+fi
+
+printf '\nVIRTIO_SND_GUEST_READY release=%s\n' "$release"
+cat /proc/asound/cards
+cat /proc/asound/pcm
+ls -l /dev/snd
+printf 'Commands: aplay -l; arecord -l; speaker-test -D hw:0,0 -c 2 -t sine -f 440 -l 1; arecord -D hw:0,0 -f S16_LE -r 48000 -c 2 -d 1 /tmp/capture.wav; aplay -D hw:0,0 /tmp/capture.wav\n'
+stty -echo </dev/console 2>/dev/null || true
+PS1=''
+export PS1
+exec /bin/sh -i

@@ -1,0 +1,190 @@
+From 5f0fd9cf601921d24f07df051f990283e571607c Mon Sep 17 00:00:00 2001
+Message-ID: <5f0fd9cf601921d24f07df051f990283e571607c.1791867377.git.mynameisjune111@gmail.com>
+In-Reply-To: <cover.1791867377.git.mynameisjune111@gmail.com>
+References: <cover.1791867377.git.mynameisjune111@gmail.com>
+From: Joonho Lee <mynameisjune111@gmail.com>
+Date: Tue, 13 Oct 2026 10:10:50 +0900
+Subject: [PATCH v1 2/5] ALSA: virtio: Recover PCM state after a failed start
+To: Anton Yakovlev <anton.yakovlev@opensynergy.com>,
+    Takashi Iwai <tiwai@suse.com>
+Cc: "Michael S. Tsirkin" <mst@redhat.com>,
+    Jaroslav Kysela <perex@perex.cz>,
+    virtualization@lists.linux.dev,
+    linux-sound@vger.kernel.org,
+    linux-kernel@vger.kernel.org
+
+Capture trigger queues I/O messages before sending PCM_START. If
+allocation of the START control message fails, trigger returns an
+error with capture I/O messages potentially pending, but without
+marking the stream stopped or arming sync_stop. If sending START
+fails, trigger also leaves transfers enabled. ALSA does not run the
+action undo callback after this trigger failure, so the normal STOP
+path cannot be relied on to drain those requests. Retrying START can
+then submit the same capture messages again.
+
+Disable transfers and mark the stream stopped after a failed start,
+and arm runtime->stop_operating so ALSA invokes sync_stop. Make
+sync_stop send RELEASE when the stream is stopped or has pending
+I/O, and keep the stream stopped when RELEASE or queue draining
+fails. Reject prepare, hw_params, and START retries until a later
+sync_stop resolves the outstanding state.
+
+Always cancel elapsed-period work in sync_stop, even when no RELEASE
+is needed.
+
+Fixes: da76e9f3e43a ("ALSA: virtio: PCM substream operators")
+Assisted-by: LLM
+Signed-off-by: Joonho Lee <mynameisjune111@gmail.com>
+---
+Dependency: patch 1 notifies capture messages successfully queued before
+a later enqueue fails, so this error path can drain them via sync_stop.
+
+Validation: source-extracted ASan/UBSan START allocation/send failures,
+retry gating and sync_stop recovery; included in the W=1 builds through
+patches 3 and 5. This commit was not separately kernel-built.
+
+ sound/virtio/virtio_pcm_ops.c | 63 +++++++++++++++++++++++++++++------
+ 1 file changed, 53 insertions(+), 10 deletions(-)
+
+diff --git a/sound/virtio/virtio_pcm_ops.c b/sound/virtio/virtio_pcm_ops.c
+index 1091100a4c98..f2362f0dd80a 100644
+--- a/sound/virtio/virtio_pcm_ops.c
++++ b/sound/virtio/virtio_pcm_ops.c
+@@ -96,6 +96,15 @@ static const struct virtsnd_a2v_rate g_a2v_rate_map[] = {
+ 
+ static int virtsnd_pcm_sync_stop(struct snd_pcm_substream *substream);
+ 
++static void virtsnd_pcm_start_failed(struct virtio_pcm_substream *vss)
++{
++	scoped_guard(spinlock_irqsave, &vss->lock) {
++		vss->xfer_enabled = false;
++		vss->stopped = true;
++	}
++	vss->substream->runtime->stop_operating = true;
++}
++
+ /**
+  * virtsnd_pcm_open() - Open the PCM substream.
+  * @substream: Kernel ALSA substream.
+@@ -115,7 +124,7 @@ static int virtsnd_pcm_open(struct snd_pcm_substream *substream)
+ 	snd_pcm_hw_constraint_integer(substream->runtime,
+ 				      SNDRV_PCM_HW_PARAM_PERIODS);
+ 
+-	vss->stopped = !!virtsnd_pcm_msg_pending_num(vss);
++	vss->stopped |= !!virtsnd_pcm_msg_pending_num(vss);
+ 	vss->suspended = false;
+ 
+ 	/*
+@@ -224,6 +233,12 @@ static int virtsnd_pcm_hw_params(struct snd_pcm_substream *substream,
+ 			vss->sid);
+ 		return -EBADFD;
+ 	}
++	if (vss->stopped) {
++		dev_err(&vdev->dev, "SID %u: stream release failed\n",
++			vss->sid);
++		substream->runtime->stop_operating = true;
++		return -EBADFD;
++	}
+ 
+ 	rc = virtsnd_pcm_dev_set_params(vss, params_buffer_bytes(hw_params),
+ 					params_period_bytes(hw_params),
+@@ -274,6 +289,13 @@ static int virtsnd_pcm_prepare(struct snd_pcm_substream *substream)
+ 	struct virtio_device *vdev = vss->snd->vdev;
+ 	struct virtio_snd_msg *msg;
+ 
++	if (vss->stopped) {
++		dev_err(&vdev->dev, "SID %u: stream release failed\n",
++			vss->sid);
++		substream->runtime->stop_operating = true;
++		return -EBADFD;
++	}
++
+ 	if (!vss->suspended) {
+ 		if (virtsnd_pcm_msg_pending_num(vss)) {
+ 			dev_err(&vdev->dev, "SID %u: invalid I/O queue state\n",
+@@ -338,23 +360,32 @@ static int virtsnd_pcm_trigger(struct snd_pcm_substream *substream, int command)
+ 
+ 		scoped_guard(spinlock_irqsave, &queue->lock) {
+ 			guard(spinlock)(&vss->lock);
++			if (vss->stopped) {
++				substream->runtime->stop_operating = true;
++				return -EBADFD;
++			}
+ 			if (vss->direction == SNDRV_PCM_STREAM_CAPTURE)
+ 				rc = virtsnd_pcm_msg_send(vss, 0, vss->buffer_bytes);
+-			if (rc)
++			if (rc) {
++				vss->stopped = true;
++				substream->runtime->stop_operating = true;
+ 				return rc;
++			}
+ 			vss->xfer_enabled = true;
+ 		}
+ 
+ 		msg = virtsnd_pcm_ctl_msg_alloc(vss, VIRTIO_SND_R_PCM_START,
+ 						GFP_KERNEL);
+ 		if (!msg) {
+-			guard(spinlock_irqsave)(&vss->lock);
+-			vss->xfer_enabled = false;
+-
++			virtsnd_pcm_start_failed(vss);
+ 			return -ENOMEM;
+ 		}
+ 
+-		return virtsnd_ctl_msg_send_sync(snd, msg);
++		rc = virtsnd_ctl_msg_send_sync(snd, msg);
++		if (rc)
++			virtsnd_pcm_start_failed(vss);
++
++		return rc;
+ 	case SNDRV_PCM_TRIGGER_SUSPEND:
+ 		vss->suspended = true;
+ 		fallthrough;
+@@ -393,21 +424,32 @@ static int virtsnd_pcm_sync_stop(struct snd_pcm_substream *substream)
+ 	struct virtio_snd *snd = vss->snd;
+ 	struct virtio_snd_msg *msg;
+ 	unsigned int js = msecs_to_jiffies(virtsnd_msg_timeout_ms);
++	bool need_release;
+ 	int rc;
+ 
++	scoped_guard(spinlock_irqsave, &vss->lock) {
++		vss->xfer_enabled = false;
++		need_release = vss->stopped || vss->msg_count;
++	}
+ 	cancel_work_sync(&vss->elapsed_period);
+-
+-	if (!vss->stopped)
++	if (!need_release)
+ 		return 0;
+ 
++	scoped_guard(spinlock_irqsave, &vss->lock)
++		vss->stopped = true;
++
+ 	msg = virtsnd_pcm_ctl_msg_alloc(vss, VIRTIO_SND_R_PCM_RELEASE,
+ 					GFP_KERNEL);
+-	if (!msg)
++	if (!msg) {
++		substream->runtime->stop_operating = true;
+ 		return -ENOMEM;
++	}
+ 
+ 	rc = virtsnd_ctl_msg_send_sync(snd, msg);
+-	if (rc)
++	if (rc) {
++		substream->runtime->stop_operating = true;
+ 		return rc;
++	}
+ 
+ 	/*
+ 	 * The spec states that upon receipt of the RELEASE command "the device
+@@ -421,6 +463,7 @@ static int virtsnd_pcm_sync_stop(struct snd_pcm_substream *substream)
+ 	if (rc <= 0) {
+ 		dev_warn(&snd->vdev->dev, "SID %u: failed to flush I/O queue\n",
+ 			 vss->sid);
++		substream->runtime->stop_operating = true;
+ 
+ 		return !rc ? -ETIMEDOUT : rc;
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

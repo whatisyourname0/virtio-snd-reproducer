@@ -1,0 +1,5 @@
+e497d704d7fefe5ee73ba72e0c5852dc61881ace90e57a9f7d82c6b58f3c9234  0001-ALSA-virtio-Notify-queued-PCM-messages-after-send-er.patch
+e0cad2029893302ad1ec053918a42a5aa508121a0384e55b366be01748b15955  0002-ALSA-virtio-Recover-PCM-state-after-a-failed-start.patch
+7dd701f8f8b017fb3ae1057da37ec908be105aeec4952b15aba671f7c21347e9  0003-ALSA-virtio-Retain-control-requests-through-device-r.patch
+6bf3a61068a24b4baaef2130e93efc901cec40b0087dee1e039d12306fec1740  0004-ALSA-virtio-Retain-PCM-DMA-pages-until-messages-are-.patch
+9b5026148d788ef84ef5384ad0d63c9229b040240469d7fb6a1e4407bf05c3c3  0005-ALSA-virtio-Keep-control-payloads-in-refcounted-mess.patch

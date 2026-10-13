@@ -1,0 +1,5 @@
+0001-ALSA-virtio-Notify-queued-PCM-messages-after-send-er.patch
+0002-ALSA-virtio-Recover-PCM-state-after-a-failed-start.patch
+0003-ALSA-virtio-Retain-control-requests-through-device-r.patch
+0004-ALSA-virtio-Retain-PCM-DMA-pages-until-messages-are-.patch
+0005-ALSA-virtio-Keep-control-payloads-in-refcounted-mess.patch

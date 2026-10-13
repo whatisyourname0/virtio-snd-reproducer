@@ -1,0 +1,65 @@
+From 01fd635f9ccd48594864e6e3858389060cdf2aa2 Mon Sep 17 00:00:00 2001
+Message-ID: <01fd635f9ccd48594864e6e3858389060cdf2aa2.1791867377.git.mynameisjune111@gmail.com>
+In-Reply-To: <cover.1791867377.git.mynameisjune111@gmail.com>
+References: <cover.1791867377.git.mynameisjune111@gmail.com>
+From: Joonho Lee <mynameisjune111@gmail.com>
+Date: Tue, 13 Oct 2026 10:10:50 +0900
+Subject: [PATCH v1 1/5] ALSA: virtio: Notify queued PCM messages after send
+ errors
+To: Anton Yakovlev <anton.yakovlev@opensynergy.com>,
+    Takashi Iwai <tiwai@suse.com>
+Cc: "Michael S. Tsirkin" <mst@redhat.com>,
+    Jaroslav Kysela <perex@perex.cz>,
+    virtualization@lists.linux.dev,
+    linux-sound@vger.kernel.org,
+    linux-kernel@vger.kernel.org,
+    Matias Ezequiel Vara Larsen <mvaralar@redhat.com>
+
+virtsnd_pcm_msg_send() advances a message length before adding it to
+the virtqueue. If a later add fails, the error path returns without
+restoring that length or notifying the device about earlier messages
+added by the same call. The device can therefore leave successfully
+queued messages unprocessed, while the failed message appears
+already submitted.
+
+Restore the failed message's length increment and notify the device
+about any earlier messages added by this call before returning the
+error. Keep the polling feature path unchanged.
+
+Fixes: fe981e67568c ("ALSA: virtio: use ack callback")
+Assisted-by: LLM
+Signed-off-by: Joonho Lee <mynameisjune111@gmail.com>
+---
+Validation: source-extracted ASan/UBSan partial-enqueue and polling
+checks; included in the W=1 builds through patches 3 and 5. This commit
+was not separately kernel-built.
+
+ sound/virtio/virtio_pcm_msg.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/sound/virtio/virtio_pcm_msg.c b/sound/virtio/virtio_pcm_msg.c
+index 72103f606716..5371f4985fd0 100644
+--- a/sound/virtio/virtio_pcm_msg.c
++++ b/sound/virtio/virtio_pcm_msg.c
+@@ -260,6 +260,18 @@ int virtsnd_pcm_msg_send(struct virtio_pcm_substream *vss, unsigned long offset,
+ 				dev_err(&vdev->dev,
+ 					"SID %u: failed to send I/O message\n",
+ 					vss->sid);
++				msg->length -= n;
++
++				/*
++				 * Do not leave earlier messages queued without notifying
++				 * the device when a later message could not be added.
++				 */
++				if (msg_count != vss->msg_count &&
++				    !(vss->features &
++				      (1U << VIRTIO_SND_PCM_F_MSG_POLLING)) &&
++				    virtqueue_kick_prepare(vqueue))
++					virtqueue_notify(vqueue);
++
+ 				return rc;
+ 			}
+ 
+-- 
+2.54.0 (Apple Git-157)
+
