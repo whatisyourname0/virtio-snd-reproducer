@@ -1,0 +1,72 @@
+From e46d7d98b1e4feac496e22bdb497182d2ff8ed09 Mon Sep 17 00:00:00 2001
+From: Joonho Lee <mynameisjune111@gmail.com>
+To: Takashi Iwai <tiwai@suse.com>,
+ "Michael S. Tsirkin" <mst@redhat.com>
+Cc: Jaroslav Kysela <perex@perex.cz>,
+ linux-sound@vger.kernel.org,
+ virtualization@lists.linux.dev,
+ linux-kernel@vger.kernel.org
+Date: Wed, 14 Oct 2026 16:19:28 +0900
+Subject: [RFC PATCH v2 1/1] ALSA: virtio: wait through signals for PCM teardown
+Message-ID: <rfc-v2-generic-control-wait-1.2eddd58a796e497f@gmail.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+In-Reply-To: <rfc-v2-generic-control-wait-0.2eddd58a796e497f@gmail.com>
+References: <rfc-v2-generic-control-wait-0.2eddd58a796e497f@gmail.com>
+
+A signal can end the interruptible wait while a STOP or RELEASE request is
+still pending. A later teardown may then submit another RELEASE before the
+first request completes.
+
+Keep both waits non-interruptible and use the existing message timeout.
+Other control requests remain interruptible. Device reset still cancels the
+pending request and wakes the waiter.
+
+Assisted-by: LLM
+Signed-off-by: Joonho Lee <mynameisjune111@gmail.com>
+---
+ sound/virtio/virtio_ctl_msg.c | 15 ++++++++++++++-
+ sound/virtio/virtio_ctl_msg.h |  3 +++
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/sound/virtio/virtio_ctl_msg.c b/sound/virtio/virtio_ctl_msg.c
+index 2e0ff15e729d..e50e6c7f3b8d 100644
+--- a/sound/virtio/virtio_ctl_msg.c
++++ b/sound/virtio/virtio_ctl_msg.c
+@@ -314,7 +314,20 @@ int virtsnd_ctl_msg_send(struct virtio_snd *snd, struct virtio_snd_msg *msg,
+ 		 */
+ 		virtsnd_ctl_msg_unref(msg);
+ 	} else if (!nowait) {
+-		rc = wait_for_completion_interruptible_timeout(&msg->notify, js);
++		/*
++		 * Teardown must observe completion even with a pending signal.
++		 * Otherwise a subsequent open can retry RELEASE while the device
++		 * is still processing the previous teardown request.
++		 */
++		switch (le32_to_cpu(request->code)) {
++		case VIRTIO_SND_R_PCM_STOP:
++		case VIRTIO_SND_R_PCM_RELEASE:
++			rc = wait_for_completion_timeout(&msg->notify, js);
++			break;
++		default:
++			rc = wait_for_completion_interruptible_timeout(&msg->notify, js);
++			break;
++		}
+ 		if (!rc) {
+ 			dev_err(&vdev->dev,
+ 				"control message (0x%08x) timeout\n",
+diff --git a/sound/virtio/virtio_ctl_msg.h b/sound/virtio/virtio_ctl_msg.h
+index f867b9b9233d..d84f0740fcb0 100644
+--- a/sound/virtio/virtio_ctl_msg.h
++++ b/sound/virtio/virtio_ctl_msg.h
+@@ -47,6 +47,9 @@ int virtsnd_ctl_msg_send(struct virtio_snd *snd, struct virtio_snd_msg *msg,
+  * The msg_timeout_ms module parameter defines the message completion timeout.
+  * If the message is not completed within this time, the function will return an
+  * error.
++ * PCM STOP and RELEASE wait through pending signals within this timeout.
++ * Other requests remain interruptible. Device reset cancels and wakes either
++ * kind of waiter.
+  *
+  * Context: Any context that permits to sleep.
+  * Return: 0 on success, -errno on failure.

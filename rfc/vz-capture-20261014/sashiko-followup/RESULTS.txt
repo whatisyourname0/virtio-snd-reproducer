@@ -1,0 +1,38 @@
+Validation results — 2026-10-14
+
+Signed patch package
+- Four implementation patches are byte-for-byte copies of the signed candidate mail patches; SHA-256 values are in PATCH-SHA256SUMS.txt.
+- Strict mail preflight with DCO required passed: 7 messages, 3 covers, 4 implementation patches, DCO_MISSING=0.
+- Strict checkpatch, whitespace checks, and source application checks passed.
+- The public source recipe exported the published base, applied the five v3 prerequisites and the four follow-up patches. The resulting eight modified kernel source files match SOURCE-HASHES.json.
+- Stable patch IDs and dependency order are in PATCH-IDS.txt. The corrected core 2/2 ID is 47ef5d4c76bf044a99192c8133e6ab9755776bde.
+
+Fresh kernel validation
+- ARM64 Image and complete module tree built with W=1 using the exact kernel.config included here.
+- CONFIG_KASAN, CONFIG_PROVE_LOCKING, CONFIG_LOCKDEP, and CONFIG_DEBUG_ATOMIC_SLEEP enabled.
+- Kernel release: 7.3.0-rc6-snd-rfc-cleanup-lockdep.
+- Image SHA-256: 52c5543c70861f76ccd8084ebf49c923801c31a69a72a52e40077f576268b277.
+- Build errors: 0. Changed sound-path warnings: 0. Existing ARM64 sys.c/traps.c override-init warnings: 517.
+- Existing focused Python suites: 24 tests passed.
+- Existing ten-case ordinary-TCG QEMU suite passed: three short-drain cases, four delayed-control cases, pending-RX recovery, and STOP/RELEASE reset-cancellation cases.
+
+Fresh packaged linked-fixture smoke
+- Recompiled the linked capture probe and published playback guard in ARM64 Alpine 3.22.
+- Created a new Alpine 3.22.6 ARM64 rootfs with the public bootstrap script. Its `/init` symlink and `/etc/inittab` invocation were checked by the packer. The resolved package listing was saved with local evidence, outside this source package.
+- Key guest package versions: alpine-release 3.22.6-r0, busybox 1.37.0-r20, alsa-lib 1.2.14-r0, alsa-utils 1.2.14-r0, and kmod 34.2-r0.
+- Rebuilt `snd_pcm_drain_test.ko` against this kernel source and Module.symvers; release and vermagic matched.
+- QEMU runner verified the initrd SHA-256 sidecar and matched the packed `snd-pcm.ko` and `virtio_snd.ko` hashes against the fresh kernel artifacts.
+- QEMU 11.1.2, TCG, `-cpu max`; QEMU exit status 0.
+- Passed unlinked and linked zero-frame drain, later-member pointer XRUN with EPIPE and two pointer calls, prepare and reopen recovery, synthetic capture, playback guard, and teardown.
+- No KASAN, lockdep, warning, BUG, oops, or panic diagnostic in the serial or host output.
+- Kernel Image SHA-256: 52c5543c70861f76ccd8084ebf49c923801c31a69a72a52e40077f576268b277.
+- `snd-pcm.ko` SHA-256: 18a2a44fbfe1c890fc3c5455c03c020040b7f8d6c5c359af6cdee1dd022338de.
+- `virtio_snd.ko` SHA-256: 6dfb6661930a8ca22e8cac2c9d45ee2b11d216cc02c60bf9ca0a686990f1c783.
+- `snd_pcm_drain_test.ko` SHA-256: 199be8843569ce23d565012d7bed5a674c440f3e6c597b03f4d7f94c8ca50599.
+- Initrd SHA-256: b70041de22d724ff61ca9a04d513468fc8b39da1fd3f71864c3bf03147b37665.
+
+Failure history and limits
+- An earlier linked-fixture invocation without `-cpu max` did not boot; the corrected TCG invocation passed. No assertion or failure threshold was relaxed.
+- An initial test-runner invocation lacked its intended pytest/import setup; rerunning the documented suites with pytest passed all 24 tests.
+- These checks use a synthetic QEMU backend. They do not establish behavior under stock QEMU, Virtualization.framework, a production LinuxKit image, or a physical microphone.
+- Runtime images, module binaries, QEMU binaries, root filesystems, package logs, and QEMU logs remain outside this source package.

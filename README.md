@@ -3,6 +3,12 @@
 This package runs host-side ASan and UBSan regressions against source extracted from a Linux Git worktree.
 It contains five signed patches and the host test harnesses, but no kernel or QEMU build, audio samples, or private lab logs.
 
+The separate [capture RFC follow-up](rfc/vz-capture-20261014/sashiko-followup/README.md)
+contains the revised core drain patch, signed RFC implementation patches,
+the KASAN/lockdep configuration, and the linked-stream regression fixture.
+Its results cover synthetic QEMU tests; the historical microphone results
+were not rerun with that kernel.
+
 ## Requirements
 
 - Python 3.10 or newer

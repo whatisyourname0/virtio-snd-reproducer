@@ -1,0 +1,17 @@
+Stable patch IDs (`git patch-id --stable`) for the exact implementation mail diffs in this package.
+
+v3 prerequisite patches already listed in the parent RFC package:
+39fb327a004c966ab90f66a34a64bbdbb3ffb475  ALSA: virtio: Propagate PCM send failures through ACK
+7c6bc344656fd839ae0d697ba18d66ac0b47827a  ALSA: virtio: Recover PCM state after a failed start
+9dd290ac3147fa7b49a475d7df8a6172778f2860  ALSA: virtio: Retain queued messages through device reset
+f4c24a5e441343a690f4ac2437f181c815bc23d0  ALSA: virtio: Keep PCM DMA buffers alive through device ownership
+ab4a5b770247a65272ab7af18a75a147daf81287  ALSA: virtio: Keep control payloads alive through DMA completion
+
+Signed follow-up patches in this package:
+cfe3e7000e695a2fda27993f4d9acf0a637cf24e  generic-control-wait: ALSA: virtio: wait through signals for PCM teardown
+0fc5fec2c6ac5d3043cf2210570472ed4ce32952  core-capture-drain 1/2: ALSA: pcm: allow capture reads while draining
+47ef5d4c76bf044a99192c8133e6ab9755776bde  core-capture-drain 2/2, corrected: ALSA: pcm: refresh capture pointers before drain
+771e8815f2b874d98376f309dc60bc90244f378c  vz-capture-compat: ALSA: virtio: stage VZ capture and restart paused streams
+
+Superseded submitted core 2/2 patch ID (do not use):
+e80331d5aa4803903cc7aa13fa910f70040621ca

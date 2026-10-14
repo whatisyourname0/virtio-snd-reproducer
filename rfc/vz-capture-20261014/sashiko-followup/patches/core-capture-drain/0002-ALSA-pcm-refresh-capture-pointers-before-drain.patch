@@ -1,0 +1,72 @@
+From 8a75aaf60a3308db931957c678174ae00d1ea85c Mon Sep 17 00:00:00 2001
+From: Joonho Lee <mynameisjune111@gmail.com>
+To: Takashi Iwai <tiwai@suse.com>,
+ Jaroslav Kysela <perex@perex.cz>
+Cc: linux-sound@vger.kernel.org,
+ linux-kernel@vger.kernel.org,
+ linux-api@vger.kernel.org
+Date: Wed, 14 Oct 2026 16:19:28 +0900
+Subject: [RFC PATCH v2 2/2] ALSA: pcm: refresh capture pointers before drain
+Message-ID: <rfc-v2-core-capture-drain-2.2eddd58a796e497f@gmail.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+In-Reply-To: <rfc-v2-core-capture-drain-0.2eddd58a796e497f@gmail.com>
+References: <rfc-v2-core-capture-drain-0.2eddd58a796e497f@gmail.com>
+
+Refresh active capture pointers before the drain transition so the final
+captured tail is accounted before reads finish.
+
+Keep the link rwsem held through pointer refresh and the drain action.
+Release the initiating stream lock while refreshing, lock each running
+capture member only while updating its pointer, then reacquire the
+initiating lock before the state transition. Pair the rwsem on every
+exit and retain the existing error cleanup path.
+
+Assisted-by: LLM
+Signed-off-by: Joonho Lee <mynameisjune111@gmail.com>
+---
+ sound/core/pcm_native.c | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
+index defbb2977efe..5375f8f931d9 100644
+--- a/sound/core/pcm_native.c
++++ b/sound/core/pcm_native.c
+@@ -2176,14 +2176,32 @@ static int snd_pcm_drain(struct snd_pcm_substream *substream,
+ 	} else if (substream->f_flags & O_NONBLOCK)
+ 		nonblock = 1;
+ 
++	/* Keep linked runtimes alive until the initial drain action completes. */
++	down_read(&snd_pcm_link_rwsem);
+ 	snd_pcm_stream_lock_irq(substream);
+-	/* resume pause */
++	/* Resume before refreshing capture positions. */
+ 	if (runtime->state == SNDRV_PCM_STATE_PAUSED)
+ 		snd_pcm_pause(substream, false);
++	snd_pcm_stream_unlock_irq(substream);
++
++	/* A pointer error may stop the group: hold only this member's lock. */
++	snd_pcm_group_for_each_entry(s, substream) {
++		if (s->stream != SNDRV_PCM_STREAM_CAPTURE)
++			continue;
++		snd_pcm_stream_lock_irq(s);
++		if (s->runtime->state == SNDRV_PCM_STATE_RUNNING)
++			result = snd_pcm_update_hw_ptr(s);
++		snd_pcm_stream_unlock_irq(s);
++		if (result < 0)
++			break;
++	}
+ 
+-	/* pre-start/stop - all running streams are changed to DRAINING state */
+-	result = snd_pcm_action(&snd_pcm_action_drain_init, substream,
+-				ACTION_ARG_IGNORE);
++	snd_pcm_stream_lock_irq(substream);
++	/* Change the stable group to DRAINING only after all refreshes. */
++	if (result >= 0)
++		result = snd_pcm_action(&snd_pcm_action_drain_init,
++					substream, ACTION_ARG_IGNORE);
++	up_read(&snd_pcm_link_rwsem);
+ 	if (result < 0)
+ 		goto unlock;
+ 	/* in non-blocking, we don't wait in ioctl but let caller poll */

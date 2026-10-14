@@ -1,0 +1,30 @@
+#!/bin/busybox sh
+set -eu
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+trap 'poweroff -f' EXIT
+sha256sum /lib/modules/$(uname -r)/kernel/sound/core/snd-pcm.ko /drain-test.ko /linked-drain-probe
+modprobe snd
+modprobe snd_pcm
+insmod /drain-test.ko
+arecord -l
+only=0
+for arg in $(cat /proc/cmdline); do case "$arg" in control.xrunonly=1) only=1;; esac; done
+if [ "$only" = 0 ]; then
+ timeout -k 2 5 /linked-drain-probe zero-running hw:0,0,0 hw:0,0,1 1 unlinked
+ timeout -k 2 5 /linked-drain-probe zero-running hw:0,0,0 hw:0,0,1 1 linked
+fi
+echo LINKED_XRUN_BEGIN
+timeout -k 2 5 /linked-drain-probe linked-xrun hw:0,0,0 hw:0,0,1 1 linked
+echo LINKED_XRUN_PASS
+rmmod snd_pcm_drain_test
+modprobe virtio_snd capture_staging=1 capture_packed_status=1 capture_allow_short=1
+timeout -k 3 12 arecord --fatal-errors -D hw:0,0 -t raw -f S16_LE -r 48000 -c 1 --period-size=1024 --buffer-size=4096 -d 3 /dev/null
+echo SYNTHETIC_CAPTURE_RECOVERY_PASS
+timeout -k 3 12 /playback-guard hw:0,0
+echo SYNTHETIC_PLAYBACK_PASS
+modprobe -r virtio_snd
+echo SYNTHETIC_COMPLETE

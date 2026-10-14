@@ -1,0 +1,4 @@
+22e02bd69c3b7d2876481f06fff1f207e60a41b06488ef3872ba4bcd9b508d34  patches/generic-control-wait/0001-ALSA-virtio-wait-through-signals-for-PCM-teardown.patch
+4b7db27b5fc80f60abbca71ae119d648c9f432975b8f3ec1f6b08beb8e113ffc  patches/core-capture-drain/0001-ALSA-pcm-allow-capture-reads-while-draining.patch
+83dbed5b5f10f4e0219acc1f5ff5b5bad797969126f6fefdae05a2d36d1e57b8  patches/core-capture-drain/0002-ALSA-pcm-refresh-capture-pointers-before-drain.patch
+682f43d0065ed63bb2eafc666a0eec156f64857b93b5fc9bccf07c5350ae37e2  patches/vz-capture-compat/0001-ALSA-virtio-stage-VZ-capture-and-restart-paused-stre.patch

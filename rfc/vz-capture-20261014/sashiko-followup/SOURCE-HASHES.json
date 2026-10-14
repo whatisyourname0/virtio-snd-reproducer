@@ -1,0 +1,10 @@
+{
+  "sound/core/pcm_lib.c": "f907f4061ca33213c8586b148aa13dc0c947bf44714a58a810bb94422d184d46",
+  "sound/core/pcm_native.c": "cf96e4bf23e111cd328520d4c059116c32c973262fe31e2bf4ea6a807f3df046",
+  "sound/virtio/virtio_ctl_msg.c": "74ef71debf4176371c1be7db14a97bb2436ed66ca73eda63310c708cf1f1e82a",
+  "sound/virtio/virtio_ctl_msg.h": "6d17a61ecd8c29784cdda7c3afddf6237a7cb912427934e00262911884d9e025",
+  "sound/virtio/virtio_pcm.c": "5b37bf461e1a1e34601a2006a9d4ebfaa252d211451420643f6265b7bc40dd23",
+  "sound/virtio/virtio_pcm.h": "4698b7af44768dfa918a95dc4d57b6fb312039d1812077ea5b9e4812fa9a0104",
+  "sound/virtio/virtio_pcm_msg.c": "6e875f051f66d0f5673aeed387902b9e7493b1aeaa008f98c20be4a8d12f4483",
+  "sound/virtio/virtio_pcm_ops.c": "ea5c68639d7859c87a23f30065123172b0b6ed91ea0549df5d74dc1b8cb7d604"
+}
