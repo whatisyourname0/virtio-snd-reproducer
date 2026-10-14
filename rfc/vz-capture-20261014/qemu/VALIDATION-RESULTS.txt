@@ -1,0 +1,114 @@
+Fresh candidate validation — 2026-10-14
+
+Source and build identity
+- Original base: 8d70e364e866bdfca81eee24d0688fac9472cfb9.
+- Candidate: five submitted v3 prerequisites (tip d58a3ac9b1719fdf8ce9d286be606128aeebf1aa)
+  plus the four packaged RFC implementation patches, in the documented order.
+- The eight changed source files match the current reviewed worktree exactly.
+  No production source, index, branch, commit or signoff was changed here.
+- A complete ARM64 KASAN Image and installed module tree were freshly built
+  with W=1; no historical objects or kernel/module binaries were reused.
+- Kernel release: 7.3.0-rc6-snd-lifetime-kasan.
+- Image SHA-256:
+  f9fa333e464a439768bfcdfabb197315283ea6df0a2635b46892f9b0bd78c483.
+- Config SHA-256:
+  371444ea45dd0f8cf98178872e2f44d8972ef11049b8ef9b3ff03861fd522e40.
+- Module SHA-256 values, builder Dockerfile/toolchain, full source manifest,
+  modules_install/depmod proof and warning audit: provenance/FRESH-KERNEL-BUILD.txt.
+- Build: 0 errors, 0 warnings in changed sound paths; 517 -Woverride-init
+  warnings in two unchanged ARM64 base files, documented rather than hidden.
+
+QEMU and guest inputs
+- QEMU 11.1.2 release archive SHA-256:
+  731b5681e4bb18be313231579b8efd0296c5b015fa36dc533874b639ba838016.
+- Final QEMU binary SHA-256:
+  9c15ad137a237ec8541e646d99ba1e41f33c9d4b38baf5e913eaed634411f424.
+- The initial QEMU was freshly built from the release archive. After fixing
+  the response-delay fixture, its changed C/header inputs were replayed from
+  another clean archive and compared exactly; Ninja rebuilt dependencies and
+  relinked. All four final patches apply sequentially with --fuzz=0.
+- Final patched hw/audio/virtio-snd.c SHA-256:
+  5bbf46f166484090c189735b270e0721435dcbc671304e6ddd96f6f6280639c8.
+- Final include/hw/audio/virtio-snd.h SHA-256:
+  87ded6790c7b1f8c180124dd0592ded6e3dd7ee7a75cc098652d55f88daf5b4d.
+- Patch order and hashes: provenance/SOURCE-PROVENANCE.txt.
+- Guest: freshly bootstrapped ARM64 Alpine 3.22.6; probes compiled with
+  -Wall -Wextra -Werror against libasound. No microphone input is involved.
+- Short-drain initrd SHA-256:
+  8602298bb3a227ed9d3d5313608909bf90b16e17b0e68c04486e4f069fa44f77.
+- Final lifecycle initrd SHA-256:
+  bd24d723669fc64dba4078ae5ee3d17ac621a8e772bec36a2b76958b3434c6f7.
+- Direct-reset initrd SHA-256:
+  4ebaf7582b870db9d10bb59a502d0dc53a9305cd4d5afde504be43ad2102afa1.
+- Direct runtime manifest SHA-256:
+  c931aa123d20709feffaf3d9dede847821c36ca7312c9558433d61835a6ad279.
+- Lifecycle and direct runners check the exact guest release and compare
+  packaged module bytes with the explicitly provided complete module set.
+
+Final ordinary-TCG scenarios (one fresh VM per scenario)
+1. Short drain after0: PASS; 1023 frames, FNV-1a64 20d61b4edef6d535.
+2. Short drain after1: PASS; 2047 frames, FNV-1a64 af2de207e4d27535.
+3. Drop: PASS; 0 frames, FNV-1a64 cbf29ce484222325.
+   All three also pass fatal-error capture recovery, playback drain guard
+   and teardown. No geometry, payload or fatal-overrun assertion was relaxed.
+4. PREPARE response delay: PASS; bounded -ETIMEDOUT, blocked reader ends in
+   XRUN/-EPIPE with zero frames, prepare requires reprobe, capture then works.
+5. START response delay: PASS; the same fault/reprobe/recovery checks.
+6. STOP response delay: PASS; the same fault/reprobe/recovery checks.
+7. RELEASE response delay: PASS; the same fault/reprobe/recovery checks.
+   Each state transition executes once; its response is held 1500 ms using
+   QEMU_CLOCK_VIRTUAL. The kernel timeout remains 1000 ms. The guest allows
+   the late response to complete before the explicit module reprobe.
+8. Pending RX after acknowledged STOP/RELEASE: PASS; pause times out after
+   1017 ms while the RX descriptor remains held; it completes once after
+   5.08 guest seconds; a following capture returns 1024 frames without another
+   RELEASE or reset. Expected control order and completion counts are checked.
+9. Direct STOP + SIGKILL + reset: PASS; actual request 0x0105 held; process
+   exits 137 after 1.04 guest seconds; pending=1/completed=0 before reset,
+   pending=0/completed=0 afterwards; playback/capture/replay succeeds.
+10. Direct RELEASE + SIGKILL + reset: PASS; actual request 0x0103 held;
+    corresponding timeout 1.02 guest seconds and the same cancellation and
+    playback/capture/replay checks pass.
+    Both reset cases advance guest uptime beyond the original virtual hold
+    deadline plus a conservative margin; no late completion occurs.
+No KASAN/BUG/WARNING/oops/panic diagnostic was matched in these final runs.
+
+Additional clock comparisons and retained failures
+- Final QEMU after0 also passes under HVF (3.508 wall seconds).
+- All three drain cases pass with TCG -icount shift=3,sleep=off
+  (6.164 / 6.133 / 6.710 wall seconds). These are instruction-clock functional
+  tests and are not real-time performance results. Icount also disables MTTCG.
+- The final ordinary-TCG drain wall durations were 8.135 / 7.599 / 7.763 s.
+- Two earlier ordinary-TCG after0 runs, using the pre-async QEMU binary
+  d9f87943f79c70421208ee199ae76f157e611b03131722e9c75aac38be194842,
+  passed the exact short-tail oracle but failed follow-on capture with
+  ring_capacity rejection and fatal arecord overrun (0.741 and 3.355 ms).
+  The same old binary passed with HVF. Logs show ring saturation; they do not
+  identify the exact lower-level scheduling cause. The final passing runs
+  must not be presented as proof that host-load sensitivity is permanently
+  fixed. No kernel change or buffer-size/error-policy workaround was made.
+- The old main-loop g_usleep response injector returned PREPARE success
+  after 1507 ms instead of the intended timeout. It was replaced by an
+  asynchronous response timer with reset/unrealize cancellation.
+- Old STOP/RELEASE probes wrongly required -EIO before -EPIPE. ALSA may
+  observe XRUN first and return -EPIPE directly. The corrected oracle still
+  requires bounded completion, final -EPIPE, zero frames, XRUN state and
+  exact -EIO from prepare before reprobe; negative checks reject other states.
+- Portability failures were also retained: missing QMP server mode, command
+  echo/partial-line parsing, and a mismatched PCM device readiness marker.
+  Scripts now use complete result lines, bounded QMP waits, exact device and
+  release checks; the guest verifies a real character device before readiness.
+- An initial BusyBox-only kernel-builder attempt was invalid and stopped;
+  no output from it was used. The GNU-tools builder completed successfully.
+
+Evidence and limits
+Full commands, runner output, raw guest/host logs and input hashes are retained
+in the local fresh-lifecycle-validation and direct-reset-portable-validation
+output directories; this source-only archive does not embed generated binaries,
+rootfs images, microphone recordings or large private workspace logs.
+The final four-patch QEMU fixture includes reset cleanup fixes beyond fault
+injection. Passing results concern the combined RFC candidate against that
+corrected synthetic backend, not stock-QEMU reset behavior or the generic
+five-patch v3 series in isolation. This task did not repeat actual microphone,
+VZ/Compose, device switching, sleep/wake, non-coherent DMA or NOMMU hardware
+acceptance. No email, upload, push or PR was performed.

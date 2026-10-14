@@ -1,0 +1,309 @@
+--- a/hw/audio/virtio-snd.c
++++ b/hw/audio/virtio-snd.c
+@@ -185,6 +185,91 @@
+     return valid;
+ }
+ 
++static const char *virtio_snd_pcm_control_name(uint32_t code,
++                                               unsigned int *index)
++{
++    switch (code) {
++    case VIRTIO_SND_R_PCM_SET_PARAMS:
++        *index = 0;
++        return "set_params";
++    case VIRTIO_SND_R_PCM_PREPARE:
++        *index = 1;
++        return "prepare";
++    case VIRTIO_SND_R_PCM_RELEASE:
++        *index = 2;
++        return "release";
++    case VIRTIO_SND_R_PCM_START:
++        *index = 3;
++        return "start";
++    case VIRTIO_SND_R_PCM_STOP:
++        *index = 4;
++        return "stop";
++    default:
++        return NULL;
++    }
++}
++
++static bool virtio_snd_ctrl_test_configure(VirtIOSound *vsnd, Error **errp)
++{
++    const char *config = g_getenv("QEMU_VIRTIO_SND_CTRL_TEST");
++    g_auto(GStrv) tokens = NULL;
++    uint64_t parsed;
++    uint32_t ordinal, delay_ms;
++    const char *end;
++    unsigned int index;
++    const char *name;
++
++    if (!config || !*config) {
++        return true;
++    }
++
++    tokens = g_strsplit(config, ",", -1);
++    if (g_strv_length(tokens) != 3) {
++        error_setg(errp,
++                   "Expected command,ordinal,delay_ms in "
++                   "QEMU_VIRTIO_SND_CTRL_TEST");
++        return false;
++    }
++    g_strstrip(tokens[0]);
++    g_strstrip(tokens[1]);
++    g_strstrip(tokens[2]);
++
++    if (g_str_equal(tokens[0], "set_params")) {
++        vsnd->ctrl_test_code = VIRTIO_SND_R_PCM_SET_PARAMS;
++    } else if (g_str_equal(tokens[0], "prepare")) {
++        vsnd->ctrl_test_code = VIRTIO_SND_R_PCM_PREPARE;
++    } else if (g_str_equal(tokens[0], "release")) {
++        vsnd->ctrl_test_code = VIRTIO_SND_R_PCM_RELEASE;
++    } else if (g_str_equal(tokens[0], "start")) {
++        vsnd->ctrl_test_code = VIRTIO_SND_R_PCM_START;
++    } else if (g_str_equal(tokens[0], "stop")) {
++        vsnd->ctrl_test_code = VIRTIO_SND_R_PCM_STOP;
++    } else {
++        error_setg(errp, "Unknown PCM command in QEMU_VIRTIO_SND_CTRL_TEST");
++        return false;
++    }
++
++    if (!*tokens[1] || qemu_strtou64(tokens[1], &end, 10, &parsed) || *end ||
++        !parsed || parsed > 4096) {
++        error_setg(errp, "Invalid command ordinal in QEMU_VIRTIO_SND_CTRL_TEST");
++        return false;
++    }
++    ordinal = parsed;
++    if (!*tokens[2] || qemu_strtou64(tokens[2], &end, 10, &parsed) || *end ||
++        !parsed || parsed > 10000) {
++        error_setg(errp, "Invalid delay in QEMU_VIRTIO_SND_CTRL_TEST");
++        return false;
++    }
++    delay_ms = parsed;
++
++    vsnd->ctrl_test_ordinal = ordinal;
++    vsnd->ctrl_test_delay_ms = delay_ms;
++    name = virtio_snd_pcm_control_name(vsnd->ctrl_test_code, &index);
++    info_report("virtio-snd control-test enabled: command=%s ordinal=%" PRIu32
++                " delay_ms=%" PRIu32, name, ordinal, delay_ms);
++    return true;
++}
++
+ static bool virtio_snd_capture_test_delay_configure(VirtIOSound *vsnd,
+                                                      Error **errp)
+ {
+@@ -958,9 +1043,48 @@
+  * @s: VirtIOSound device
+  * @cmd: control command request
+  */
+-static inline void
++static void virtio_snd_ctrl_cmd_complete(VirtIOSound *s,
++                                         virtio_snd_ctrl_command *cmd)
++{
++    iov_from_buf(cmd->elem->in_sg,
++                 cmd->elem->in_num,
++                 0,
++                 &cmd->resp,
++                 sizeof(virtio_snd_hdr));
++    virtqueue_push(cmd->vq, cmd->elem,
++                   sizeof(virtio_snd_hdr) + cmd->payload_size);
++    virtio_notify(VIRTIO_DEVICE(s), cmd->vq);
++}
++
++static void virtio_snd_ctrl_test_delay_cb(void *opaque)
++{
++    VirtIOSound *s = opaque;
++    virtio_snd_ctrl_command *cmd = s->ctrl_test_command;
++    unsigned int index = 0;
++    const char *control_name;
++
++    if (!s->ctrl_test_pending || !cmd) {
++        return;
++    }
++
++    s->ctrl_test_pending = false;
++    s->ctrl_test_command = NULL;
++    control_name = virtio_snd_pcm_control_name(s->ctrl_test_code, &index);
++    info_report("VIRTIO_SND_CTRL_DELAY_END sequence=%" PRIu64
++                " command=%s", s->ctrl_test_sequence, control_name);
++    virtio_snd_ctrl_cmd_complete(s, cmd);
++    virtio_snd_ctrl_cmd_free(cmd);
++}
++
++static inline bool
+ process_cmd(VirtIOSound *s, virtio_snd_ctrl_command *cmd)
+ {
++    virtio_snd_pcm_hdr pcm_hdr;
++    uint32_t stream_id = UINT32_MAX;
++    uint64_t sequence = 0;
++    unsigned int index = 0;
++    const char *control_name;
++    uint32_t ordinal = 0;
+     uint32_t code;
+     size_t msg_sz = iov_to_buf(cmd->elem->out_sg,
+                                cmd->elem->out_num,
+@@ -972,10 +1096,28 @@
+         qemu_log_mask(LOG_GUEST_ERROR,
+                 "%s: virtio-snd command size incorrect %zu vs \
+                 %zu\n", __func__, msg_sz, sizeof(virtio_snd_hdr));
+-        return;
++        return false;
+     }
+ 
+     code = le32_to_cpu(cmd->ctrl.code);
++
++    control_name = virtio_snd_pcm_control_name(code, &index);
++    if (control_name) {
++        size_t pcm_hdr_size = iov_to_buf(cmd->elem->out_sg,
++                                         cmd->elem->out_num,
++                                         0,
++                                         &pcm_hdr,
++                                         sizeof(pcm_hdr));
++
++        sequence = ++s->pcm_ctrl_sequence;
++        ordinal = ++s->pcm_ctrl_counts[index];
++        if (pcm_hdr_size == sizeof(pcm_hdr)) {
++            stream_id = le32_to_cpu(pcm_hdr.stream_id);
++        }
++        info_report("VIRTIO_SND_CTRL sequence=%" PRIu64
++                    " command=%s ordinal=%" PRIu32 " stream_id=%" PRIu32,
++                    sequence, control_name, ordinal, stream_id);
++    }
+ 
+     trace_virtio_snd_handle_code(code, print_code(code));
+ 
+@@ -1016,14 +1158,28 @@
+         cmd->resp.code = cpu_to_le32(VIRTIO_SND_S_BAD_MSG);
+     }
+ 
+-    iov_from_buf(cmd->elem->in_sg,
+-                 cmd->elem->in_num,
+-                 0,
+-                 &cmd->resp,
+-                 sizeof(virtio_snd_hdr));
+-    virtqueue_push(cmd->vq, cmd->elem,
+-                   sizeof(virtio_snd_hdr) + cmd->payload_size);
+-    virtio_notify(VIRTIO_DEVICE(s), cmd->vq);
++    if (control_name) {
++        info_report("VIRTIO_SND_CTRL_RESULT sequence=%" PRIu64
++                    " command=%s response=%" PRIu32,
++                    sequence, control_name, le32_to_cpu(cmd->resp.code));
++        if (!s->ctrl_test_fired && code == s->ctrl_test_code &&
++            ordinal == s->ctrl_test_ordinal) {
++            s->ctrl_test_fired = true;
++            s->ctrl_test_pending = true;
++            s->ctrl_test_command = cmd;
++            s->ctrl_test_sequence = sequence;
++            info_report("VIRTIO_SND_CTRL_DELAY_BEGIN sequence=%" PRIu64
++                        " command=%s delay_ms=%" PRIu32,
++                        sequence, control_name, s->ctrl_test_delay_ms);
++            timer_mod(s->ctrl_test_timer,
++                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
++                      s->ctrl_test_delay_ms);
++            return true;
++        }
++    }
++
++    virtio_snd_ctrl_cmd_complete(s, cmd);
++    return false;
+ }
+ 
+ /*
+@@ -1034,6 +1190,7 @@
+ static void virtio_snd_process_cmdq(VirtIOSound *s)
+ {
+     virtio_snd_ctrl_command *cmd;
++    bool deferred;
+ 
+     if (unlikely(qatomic_read(&s->processing_cmdq))) {
+         return;
+@@ -1045,11 +1202,13 @@
+             cmd = QTAILQ_FIRST(&s->cmdq);
+ 
+             /* process command */
+-            process_cmd(s, cmd);
++            deferred = process_cmd(s, cmd);
+ 
+             QTAILQ_REMOVE(&s->cmdq, cmd, next);
+ 
+-            virtio_snd_ctrl_cmd_free(cmd);
++            if (!deferred) {
++                virtio_snd_ctrl_cmd_free(cmd);
++            }
+         }
+         qatomic_set(&s->processing_cmdq, false);
+     }
+@@ -1376,6 +1535,9 @@
+         !virtio_snd_capture_test_pause_configure(vsnd, errp)) {
+         return;
+     }
++    if (!virtio_snd_ctrl_test_configure(vsnd, errp)) {
++        return;
++    }
+ 
+     if (!audio_be_check(&vsnd->audio_be, errp)) {
+         return;
+@@ -1385,6 +1547,8 @@
+     vsnd->capture_test_delay_timer =
+         timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                      virtio_snd_capture_test_delay_cb, vsnd);
++    vsnd->ctrl_test_timer =
++        timer_new_ms(QEMU_CLOCK_VIRTUAL, virtio_snd_ctrl_test_delay_cb, vsnd);
+ 
+     vsnd->vmstate =
+         qemu_add_vm_change_state_handler(virtio_snd_vm_state_change, vsnd);
+@@ -2101,6 +2265,17 @@
+     timer_free(vsnd->capture_test_delay_timer);
+     vsnd->capture_test_delay_timer = NULL;
+ 
++    timer_del(vsnd->ctrl_test_timer);
++    if (vsnd->ctrl_test_command) {
++        virtqueue_detach_element(vsnd->ctrl_test_command->vq,
++                                 vsnd->ctrl_test_command->elem, 0);
++        virtio_snd_ctrl_cmd_free(vsnd->ctrl_test_command);
++        vsnd->ctrl_test_command = NULL;
++    }
++    vsnd->ctrl_test_pending = false;
++    timer_free(vsnd->ctrl_test_timer);
++    vsnd->ctrl_test_timer = NULL;
++
+     qemu_del_vm_change_state_handler(vsnd->vmstate);
+     trace_virtio_snd_unrealize(vsnd);
+ 
+@@ -2138,6 +2313,15 @@
+     vsnd->capture_test_pause_stream_id = UINT32_MAX;
+     qemu_mutex_unlock(&vsnd->capture_test_mutex);
+ 
++    timer_del(vsnd->ctrl_test_timer);
++    if (vsnd->ctrl_test_command) {
++        virtqueue_detach_element(vsnd->ctrl_test_command->vq,
++                                 vsnd->ctrl_test_command->elem, 0);
++        virtio_snd_ctrl_cmd_free(vsnd->ctrl_test_command);
++        vsnd->ctrl_test_command = NULL;
++    }
++    vsnd->ctrl_test_pending = false;
++
+     /*
+      * Sanity check that the invalid buffer message queue is emptied at the end
+      * of every virtio_snd_handle_tx_xfer/virtio_snd_handle_rx_xfer call, and
+--- a/include/hw/audio/virtio-snd.h
++++ b/include/hw/audio/virtio-snd.h
+@@ -256,6 +256,18 @@
+     bool capture_test_pause_after;
+     bool capture_test_rx_paused;
+     uint32_t capture_test_pause_stream_id;
++    /* One-shot delayed response for PCM control-state fault testing. */
++    uint32_t ctrl_test_code;
++    uint32_t ctrl_test_ordinal;
++    uint32_t ctrl_test_delay_ms;
++    uint32_t ctrl_test_seen;
++    QEMUTimer *ctrl_test_timer;
++    virtio_snd_ctrl_command *ctrl_test_command;
++    uint64_t ctrl_test_sequence;
++    uint32_t pcm_ctrl_counts[5];
++    uint64_t pcm_ctrl_sequence;
++    bool ctrl_test_pending;
++    bool ctrl_test_fired;
+     /*
+      * Convenience queue to keep track of invalid tx/rx queue messages inside
+      * the tx/rx callbacks.

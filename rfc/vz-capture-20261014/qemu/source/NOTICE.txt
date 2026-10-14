@@ -1,0 +1,7 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+The C probes and lab-init are test scaffolding copied from the local
+virtio-snd validation fixtures. This package adds an SPDX identifier but does
+not change their test logic. QEMU fault patches modify QEMU GPL-2.0-or-later
+source and remain test-only. The parent reproducer-ready/GPL-2.0.txt contains
+the GPL-2.0 license text for this package.

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Rebuild from qemu/ with:
+# docker build --platform linux/arm64 --file Dockerfile.kernel-builder --tag industrial-virtio-module-builder:alpine322-gnu .
+FROM alpine:3.22.6@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+
+RUN apk add --no-cache \
+    gcc musl-dev make binutils elfutils-dev openssl-dev perl python3 bash \
+    flex bison bc git kmod coreutils findutils
+
+CMD ["/bin/sh"]

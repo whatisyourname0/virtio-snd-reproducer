@@ -1,0 +1,102 @@
+From 69ea1abeba81273fafd1b27bbdb042d0c6eae54f Mon Sep 17 00:00:00 2001
+From: Draft patch author <draft-author@example.invalid>
+Date: Wed, 14 Oct 2026 09:21:50 +0900
+Subject: [RFC PATCH 0/2] ALSA: pcm: preserve capture tail during drain
+
+Base: d58a3ac9b1719fdf8ce9d286be606128aeebf1aa
+      ("ALSA: virtio: Keep control payloads alive through DMA completion")
+      Local tip of the five submitted v3 patches; not an upstream commit.
+Previous series: <cover.1791881787.git.mynameisjune111@gmail.com>
+Link: https://lore.kernel.org/all/cover.1791881787.git.mynameisjune111@gmail.com/
+
+This is a follow-up RFC, not a replacement or v4 of that five-patch series.
+The submitted v3 fixes ACK error propagation, failed START recovery, and
+message/buffer lifetime through completion and reset. It does not add the
+VZ capture profile or the ALSA core drain handling in these companion RFCs.
+
+This series proposes two changes to capture drain handling:
+
+1. Permit capture transfer calls while the runtime is DRAINING, so buffered
+   tail frames remain readable instead of returning -EBADFD at the state
+   check. Playback access rules remain unchanged.
+2. Refresh active capture hardware pointers before the linked group enters
+   DRAINING, so a final subperiod tail is accounted. Hold the link read lock
+   across the initial operation and take each member's stream lock for its
+   pointer refresh. Propagate pointer errors before the drain transition.
+
+These are ALSA core changes, not VZ quirks. They apply with all VZ options
+disabled and can affect other capture drivers, including linked-stream drain
+ordering. No new ioctl is added, but applications can observe buffered data
+where the previous state check rejected a read. The appropriate core drain
+semantics and locking scope need review independently of VZ support.
+
+Dependencies
+
+Apply these two patches in order on v3. They do not depend on the companion
+STOP/RELEASE wait patch. The VZ capture RFC requires all three prerequisites.
+The base is pinned for reproducibility; this is not a claim that the core
+changes are inherently dependent on virtio-snd lifetime fixes.
+
+Validation and limits
+
+The complete local candidate (v3 plus all four RFC patches) was freshly
+built on 2026-10-14 as an ARM64 KASAN Image and installed module set with
+W=1, release 7.3.0-rc6-snd-lifetime-kasan. No old kernel objects were reused.
+There were no build errors or warnings in the changed sound paths; 517
+-Woverride-init warnings remain in two unchanged ARM64 base files.
+This is a rebuild of the pinned candidate, not a rebase to a newer upstream
+or sound maintainer tree.
+
+With this kernel under ordinary TCG, no-query short-tail drain returns
+1023 frames (FNV-1a64 20d61b4edef6d535) and 2047 frames
+(af2de207e4d27535); drop returns zero. Each run also passes a following
+capture with fatal-overrun checking, playback drain guard and teardown.
+Earlier W=1 core builds included patch 1 alone. The separate historical
+linked-pointer-error fixture used an earlier stable virtio-snd module to
+isolate the core change; it is not one of the ten current candidate cases.
+
+The QEMU 11.1.2 fixture includes backend reset cleanup changes as well as
+fault injection. These are integrated candidate results, not standalone
+v3 or isolated-patch proof, and not stock-QEMU, VZ or hardware acceptance.
+Earlier runs failed follow-on capture with ring saturation and overruns;
+those logs remain retained. Final passes do not establish a permanent fix
+for load or clock/scheduling sensitivity.
+
+Physical ALSA devices and the full range of linked capture/playback groups
+remain untested. Historical AirPods capture does not isolate core drain
+semantics. Playback access rules remain unchanged, but the shared drain
+entry locking/order changes also need review for playback-led groups.
+
+Reproducer
+
+A source-only bundle contains the pinned base/v3/RFC preparation recipe,
+kernel builder, QEMU patch stack, guest probes and all ten runtime commands.
+See qemu/README.txt and qemu/VALIDATION-RESULTS.txt in that bundle. The final
+runtime set passed under ordinary TCG; no KASAN/BUG/WARNING/oops/panic was
+matched. The 24 Python harness tests and relocated source comparison also
+passed. Existing v3 patches are included only as build prerequisites, not
+for resubmission. Publication or delivery of the bundle is still pending;
+this local draft does not claim an available public download.
+
+Questions for review
+
+- Is reading buffered capture data in DRAINING the intended ALSA contract,
+  or should the driver expose that tail through a different transition?
+- Is drain entry the correct place to refresh capture pointers, including
+  when draining a paused stream or a linked capture/playback group?
+- Is the proposed link-lock/member-lock scope appropriate when a pointer
+  error can stop the group? Which other driver or linked-stream cases
+  should be required before treating this as a general core fix?
+
+Local review draft: the author name/address are placeholders. Human author
+confirmation and DCO certification are still required before sending.
+No human Signed-off-by has been added. Assisted-by: LLM.
+
+Draft patch author (2):
+  ALSA: pcm: allow capture reads while draining
+  ALSA: pcm: refresh capture pointers before drain
+
+ sound/core/pcm_lib.c    | 10 +++++++---
+ sound/core/pcm_native.c | 32 +++++++++++++++++++++++++-------
+ 2 files changed, 32 insertions(+), 10 deletions(-)
+

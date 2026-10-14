@@ -1,0 +1,28 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-only
+set -eu
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+trap 'poweroff -f' EXIT
+frames=1023
+hash=20d61b4edef6d535
+action=drain
+for arg in $(cat /proc/cmdline); do
+ case "$arg" in probe.frames=*) frames=${arg#*=};; probe.hash=*) hash=${arg#*=};; probe.action=drop) action=drop;; esac
+done
+sha256sum /lib/modules/$(uname -r)/kernel/sound/virtio/virtio_snd.ko /lib/modules/$(uname -r)/kernel/sound/core/snd-pcm.ko /no-query-probe
+modprobe snd
+modprobe snd_pcm
+modprobe virtio_snd capture_staging=1 capture_packed_status=1 capture_allow_short=1
+result=0
+timeout -k 3 12 /no-query-probe hw:0,0 "$action" "$frames" "$hash" 1024 120 || result=$?
+echo "NO_QUERY_PROBE_RC=$result"
+timeout -k 3 12 arecord --fatal-errors -D hw:0,0 -t raw -f S16_LE -r 48000 -c 1 --period-size=1024 --buffer-size=4096 -d 3 /dev/null
+echo NO_QUERY_RECOVERY_PASS
+timeout -k 3 12 /playback-guard hw:0,0
+echo NO_QUERY_PLAYBACK_PASS
+modprobe -r virtio_snd
+echo NO_QUERY_COMPLETE

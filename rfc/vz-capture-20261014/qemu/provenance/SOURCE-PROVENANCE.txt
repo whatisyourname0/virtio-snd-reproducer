@@ -1,0 +1,151 @@
+# QEMU capture-drain and lifecycle bundle provenance
+
+## QEMU source and injection patches
+
+The baseline archive is the QEMU 11.1.2 release archive:
+qemu-11.1.2.tar.xz, SHA-256
+731b5681e4bb18be313231579b8efd0296c5b015fa36dc533874b639ba838016.
+
+The pristine source-file hashes checked by scripts/build-qemu.sh are:
+
+- hw/audio/virtio-snd.c:
+  fe33f3fdf897c98cb1cceae49121f0d28ea3ae783523c41e8a9b9a3af37ec821
+- include/hw/audio/virtio-snd.h:
+  23ed716769ced2f13b54a38f32d56172183ddc858dd476c98217b2823502d53e
+
+The patch stack order is required:
+
+1. qemu-capture-faults.patch, SHA-256
+   588a804dec095cbd88534c7236cc9a832ab6dc948ffaec262db8529e725c4349
+2. qemu-capture-drain-r1.patch, SHA-256
+   be4d923a8401bf60620c71f9702f59ab4332a16c084975880936cc08698ecdfd
+3. qemu-fsm-control-delay.patch, SHA-256
+   f11e9b7a6ffda0eb860c03c6fea6617931e8954a2bab612c642307aa4d294cf1
+4. ../direct-reset/patches/qemu-direct-reset-cancel.patch, SHA-256
+   04bb339fdce47bc6b02073fb6eb5a2ff2d78bf9f69224aedad8812155080c6f8
+
+The build helper applies the first three patches by default. Pass the fourth
+with --extra-patch for the pending-RX and direct-reset cases. All ten cases
+in the current fresh-build validation use this same four-patch QEMU binary.
+The FSM patch holds an already-executed command's response on a virtual
+clock timer without blocking QEMU's main loop. It cancels its own timer and
+held descriptor on reset/unrealize, including in a three-patch build.
+The original g_usleep-based injection was rejected after a TCG PREPARE run
+returned success instead of the intended timeout. Failure logs were retained.
+The fourth patch also corrects synthetic backend reset cleanup, beyond fault
+injection: timer cancellation, queued element detachment and stream shutdown.
+Results against that backend are not evidence of stock-QEMU reset behavior.
+
+The second patch is a delta on the first patch's source, not on pristine
+QEMU. Both patches came from the local synthetic QEMU fixture used by
+drain-no-query-fixture. They modify QEMU test fixture code only. Do not apply
+them to production or treat the environment-variable controls as QEMU APIs.
+
+## Guest test sources
+
+The source files were copied from the local fixture sources, with SPDX
+identifiers added in this package:
+
+- capture_drain_no_query_test.c original fixture SHA-256:
+  8e02972fc5143ef6c372ea4bcf45e2ec35fb15f27d88830979c7772dae0b55a0
+- playback_drain_guard.c original fixture SHA-256:
+  879612c7c867a6395be96957266583674bff73bb5548930c4ca1c51a31925d73
+- lab-init original fixture SHA-256:
+  b0c9fbaaf84685dce5850fa7bf3c9cd31cbc5604c3840efab61ebbb217343df0
+
+The C probes require libasound at build and runtime. They use synthetic
+virtio-snd data and no physical audio input. Alpine package versions were
+recorded in the source validation rootfs, but package repositories advance;
+record apk info -vv output when creating a fresh rootfs.
+
+## Current fresh build
+
+See FRESH-KERNEL-BUILD.txt for the complete candidate Image/modules build
+and ../VALIDATION-RESULTS.txt for current runtime outcomes. The records below
+are retained as historical evidence and do not identify the current binaries.
+
+## Historical integration evidence (not a fresh build)
+
+The original snapshot3-integrated-qemu fixture used:
+
+- Kernel source manifests: driver
+  9c3792fe5ef62cf8b48db09d66641b2b2e6dac397abacf951a932de9f2c76388;
+  ALSA core
+  48302261ad0ed53fef4c1aceb509a72afb87a5ec705836c8d8c3bde00a92e336.
+- virtio_snd.ko SHA-256:
+  d81f0aec190e3d942e21fd312b83f7ee15e83284cd5be31990486d4620e083e2
+- snd-pcm.ko SHA-256:
+  eca5fc9bcabba90766c0a8f405183019540e2afc9776ce4912322abeec0ec25f
+- Kernel Image SHA-256:
+  e5909077c48a5fcd2262cf700dd60bdeb65afd4421df5cc2fea1efb5fd6cf3e1
+- QEMU capture fixture binary SHA-256:
+  6cb5758a877c8e2d7c15c8fc17d7b8b9126f623812ee0f70066cab4290f5a310
+- Initrd SHA-256:
+  22ac8adb8dc4f3088801b5332e40627fc57452e52f6565ce5e9604bfd3aa97ef
+- Kernel release: 7.3.0-rc6-snd-lifetime-kasan.
+
+The recorded after0, after1, and drop runs exited with QEMU status 0 and
+reported matching frame counts and FNV-1a64 hashes. They also reported capture
+recovery, playback guard success, module teardown, and no KASAN/BUG/WARNING/
+oops/panic diagnostics. This package does not include those binaries or the
+historical initrd. Re-running the scripts against freshly built artifacts is
+the validation for this bundle.
+
+## Lifecycle test status
+
+The separate reset-control-3 historical case held PCM STOP (0x0105) and RELEASE
+(0x0103), killed the blocking caller, observed driver timeout at about one
+second, reset/unbound/rebound the device, and verified recovery. Its source
+runner is reset-control-3/tests/run_kasan_direct_control.py, with helpers in
+reset-control-3/support/run_kasan_runtime.py. The local historical invocations
+were python3 reset-control-3/tests/run_kasan_direct_control.py stop and the
+same command with release. They depend on a sibling private QEMU build,
+firmware, and pinned KASAN guest artifacts; they are not portable commands for
+this source-only package. The corresponding QEMU patch files were
+revision3-timeout-reset/direct-control/artifacts/pre-resetfix-qemu-snd.patch
+(SHA-256 60a85c9f1f75824c71ba05f62c2e902d462b90f8c8c9a3da6eb119c6f44dec92)
+and resetfix-qemu-snd.patch (SHA-256
+5f15e941c084c18ff95a9f6277f01b0c4ffe3455a64bcb68e62a3ed69b00b534). They are
+not based directly on pristine QEMU 11.1.2, so they are not copied into this
+bundle. No STOP/RELEASE reproduction is claimed by
+scripts/run-short-packed-drain.py.
+
+The other historical fixtures snapshot3-fsm-qemu and snapshot3-release-rxflush
+test delayed control completion, pending receive completion, reset, and
+pause/restart. Their historical logs remain separate synthetic-QEMU evidence.
+The portable lifecycle subset is documented in `lifecycle/README.txt`; it
+covers four delayed FSM controls and one pending-RX pause/recovery case.
+The direct STOP/RELEASE timeout and reset-cancellation subset is documented in
+`direct-reset/README.txt` and has its own source-only runner and provenance.
+The current package defines ten runtime cases across these lanes and the three
+short-drain cases. A current result still requires building the packaged
+sources and running them with the exact fresh candidate kernel and modules.
+
+## Portable lifecycle sources and QEMU fixture patches
+
+The lifecycle probe `lifecycle/source/fsm_control_probe.c` is copied unchanged
+from the revision7-fsm-control-acceptance source, SHA-256
+`9579aaadf80e972e83714336688cfcfd1d5f26d3eec68dcfda738b8c2329cbe6` before
+the package SPDX header.
+
+The pending-RX probe follows the snapshot3-release-rxflush source, original
+SHA-256
+`1b9ddce6d92f9449aa557a2ff4f58cbded7a898ef28ece718a8d161fa538ddc1`.
+The package version adds SPDX metadata and fixes a fixture lost-wake race by
+blocking SIGUSR1/SIGUSR2, waiting with `sigsuspend`, checking helper errors,
+and restoring the original signal mask. Its kernel behavior assertions are
+unchanged. `lifecycle/source/trace.events` is copied unchanged from that
+fixture, SHA-256
+`753c4f462230166cb68081d44c04eed9dadcdd75304b96656c28741b7c62db29`.
+
+The portable QEMU patch stack keeps the existing capture patches, then adds
+`patches/qemu-fsm-control-delay.patch`, SHA-256
+`f11e9b7a6ffda0eb860c03c6fea6617931e8954a2bab612c642307aa4d294cf1`.
+The FSM fixture executes the selected control command once and delays only its
+response descriptor using a QEMU virtual timer. Its reset and unrealize paths
+cancel the timer and detach/free an outstanding response descriptor.
+Pending-RX also applies
+`direct-reset/patches/qemu-direct-reset-cancel.patch`, SHA-256
+`04bb339fdce47bc6b02073fb6eb5a2ff2d78bf9f69224aedad8812155080c6f8`, as an
+ordered extra patch. These patches add test-only QEMU injection and QMP
+properties; no production kernel instrumentation is required.

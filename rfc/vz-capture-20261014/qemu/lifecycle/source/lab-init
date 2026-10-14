@@ -1,0 +1,83 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-only
+set -eu
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+
+mode=
+pending_interactive=0
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        fsm.mode=*) mode=${arg#*=} ;;
+        lifecycle.mode=*) mode=${arg#*=} ;;
+    esac
+done
+
+finish_lifecycle() {
+    status=$?
+    trap - EXIT
+    if [ "$pending_interactive" -eq 0 ]; then
+        if [ "$status" -ne 0 ]; then
+            echo "LIFECYCLE_INIT_FAIL mode=$mode status=$status"
+        fi
+        poweroff -f || true
+    fi
+    exit "$status"
+}
+trap finish_lifecycle EXIT
+
+release=$(uname -r)
+module_dir="/lib/modules/$release"
+module_options='capture_staging=1 capture_packed_status=1 capture_allow_short=1 capture_allow_empty=1 capture_pause_restart=1'
+
+echo "LIFECYCLE_GUEST_BOOT mode=$mode release=$release"
+sha256sum "$module_dir/kernel/sound/virtio/virtio_snd.ko" \
+    "$module_dir/kernel/sound/core/snd-pcm.ko" \
+    /fsm_control_probe /pause-rxflush-probe
+modprobe snd
+modprobe snd_pcm
+modprobe virtio_snd $module_options
+for parameter in capture_staging capture_packed_status capture_allow_short \
+                 capture_allow_empty capture_pause_restart; do
+    value=$(cat "/sys/module/virtio_snd/parameters/$parameter")
+    echo "VIRTSND_MODULE_PARAM_${parameter}=$value"
+done
+
+case "$mode" in
+    stop|release|prepare|start)
+        echo "FSM_BOOT mode=$mode release=$release"
+        arecord -l
+        timeout -k 2 25 /fsm_control_probe "$mode"
+        echo "FSM_LATE_RESPONSE_GRACE_BEGIN mode=$mode seconds=1"
+        sleep 1
+        echo "FSM_LATE_RESPONSE_GRACE_END mode=$mode"
+        echo "FSM_REPROBE_BEGIN mode=$mode"
+        modprobe -r virtio_snd
+        modprobe virtio_snd $module_options
+        timeout -k 2 12 arecord --fatal-errors -q -D hw:0,0 -t raw \
+            -f S16_LE -r 48000 -c 1 --period-size=1024 \
+            --buffer-size=4096 -d 1 /dev/null
+        echo "FSM_REPROBE_RECOVERY_PASS mode=$mode"
+        modprobe -r virtio_snd
+        echo "FSM_CASE_COMPLETE mode=$mode"
+        ;;
+    pending-rx)
+        arecord -l
+        echo "VIRTIO_SND_GUEST_READY release=$release"
+        stty -echo </dev/console 2>/dev/null || true
+        PS1=''
+        export PS1
+        pending_interactive=1
+        exec /bin/sh -i || {
+            pending_interactive=0
+            exit 127
+        }
+        ;;
+    *)
+        echo "LIFECYCLE_FAIL invalid mode=$mode"
+        exit 2
+        ;;
+esac

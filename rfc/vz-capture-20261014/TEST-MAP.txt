@@ -1,0 +1,46 @@
+What the reproducibility lanes establish
+
+Generic-control-wait RFC
+- Primary: extracted virtsnd_ctl_msg_send completion wait test, candidate vs
+  v3 baseline. STOP and RELEASE cover pending signal, timeout, completion,
+  reset; other requests retain interruptibility.
+- Runtime: direct SIGKILL during playback holds a real STOP or RELEASE
+  descriptor, measures the bounded guest-time wait, resets/rebinds, checks
+  cancellation without late completion, then plays, captures and replays.
+- Limitation: the host suite models wait primitives. Integrated QEMU cases
+  include the other RFCs and a corrected synthetic QEMU reset backend; they
+  are not standalone proof of the generic patch or stock-QEMU behavior.
+
+ALSA core capture-drain RFC (two patches)
+- Primary runtime lane: synthetic QEMU short capture completion, stop/drain,
+  exact residual byte count/hash, next capture and playback checks.
+- The complete candidate combines core and VZ driver changes. Success of
+  the integrated case does not prove a core patch in isolation or coverage
+  of physical ALSA devices and every linked-stream configuration.
+- Patch 1-only W=1 build exists in historical validation; not a standalone
+  runtime proof. Do not equate compilation with behavior acceptance.
+
+VZ capture compatibility RFC
+- Source-level: staged buffer/counter/ACK failure and lifetime invariants.
+- Synthetic runtime: test-only QEMU short-completion injection and recovery;
+  delayed PREPARE/START/STOP/RELEASE fail closed until module reprobe; a held
+  RX descriptor after acknowledged RELEASE completes and permits recovery.
+- Runtime outcome and timing limits: qemu/VALIDATION-RESULTS.txt. A packaged
+  runnable case is not a claim that it passed under every accelerator.
+- Hardware: separately documented AirPods/VZ/Compose acceptance. This package
+  does not include the private recorder image or a rebuilt macOS launcher.
+- Event-handler hook results do not prove the device event virtqueue itself.
+
+Inherited generic v3 regressions
+PCM/control lifetime, remove/freeze ordering, stopped locking, DMA and NOMMU
+buffer ownership, payload alignment and ACK failure tests are guards against
+breaking previously fixed behavior. Their success is not evidence of a new
+RFC-only fix. The original v3 public reproducer and submitted patches remain
+separate contributions.
+
+Negative controls
+Each baseline must match the defect being checked. Original pre-series source
+is suitable for many v3 defects; the submitted v3 is suitable for the new
+STOP/RELEASE wait change. Alignment-specific v1/v2 regressions need those
+actual versions and must not be relabeled as failures of the final v3.
+A missing expected failure should fail the test, not silently count as PASS.

@@ -1,0 +1,3 @@
+virtio_snd_handle_code
+virtio_snd_handle_pcm_start_stop
+virtio_snd_handle_pcm_release

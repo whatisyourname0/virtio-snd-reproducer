@@ -1,0 +1,694 @@
+--- a/hw/audio/virtio-snd.c
++++ b/hw/audio/virtio-snd.c
+@@ -21,6 +21,7 @@
+ #include "qemu/log.h"
+ #include "qemu/error-report.h"
+ #include "qemu/lockable.h"
++#include "qemu/timer.h"
+ #include "system/runstate.h"
+ #include "trace.h"
+ #include "qapi/error.h"
+@@ -32,6 +33,7 @@
+ #define VIRTIO_SOUND_CHMAP_DEFAULT 0
+ #define VIRTIO_SOUND_HDA_FN_NID 0
+ #define VIRTIO_SND_CAPTURE_TEST_LIMIT 4096
++#define VIRTIO_SND_CAPTURE_TEST_DELAY_MAX_MS 60000U
+ 
+ static const char *virtio_snd_capture_test_mode_name(
+     VirtIOSoundCaptureTestMode mode)
+@@ -183,11 +185,89 @@
+     return valid;
+ }
+ 
++static bool virtio_snd_capture_test_delay_configure(VirtIOSound *vsnd,
++                                                     Error **errp)
++{
++    const char *config =
++        g_getenv("QEMU_VIRTIO_SND_CAPTURE_TEST_DELAY_MS");
++    uint64_t parsed;
++    const char *end;
++
++    if (!config || !*config) {
++        return true;
++    }
++    if (vsnd->capture_test_mode != VIRTIO_SND_CAPTURE_TEST_SHORT_FIXED &&
++        vsnd->capture_test_mode != VIRTIO_SND_CAPTURE_TEST_SHORT_PACKED) {
++        error_setg(errp,
++                   "QEMU_VIRTIO_SND_CAPTURE_TEST_DELAY_MS requires "
++                   "short-fixed or short-packed mode");
++        return false;
++    }
++    if (vsnd->capture_test_count != 1) {
++        error_setg(errp,
++                   "QEMU_VIRTIO_SND_CAPTURE_TEST_DELAY_MS requires count=1");
++        return false;
++    }
++    if (qemu_strtou64(config, &end, 10, &parsed) || *end || !parsed ||
++        parsed > VIRTIO_SND_CAPTURE_TEST_DELAY_MAX_MS) {
++        error_setg(errp,
++                   "Invalid value in QEMU_VIRTIO_SND_CAPTURE_TEST_DELAY_MS "
++                   "(expected 1..%u)",
++                   VIRTIO_SND_CAPTURE_TEST_DELAY_MAX_MS);
++        return false;
++    }
++
++    vsnd->capture_test_delay_ms = (uint32_t)parsed;
++    info_report("virtio-snd capture-test delay enabled: mode=%s "
++                "delay_ms=%" PRIu32,
++                virtio_snd_capture_test_mode_name(vsnd->capture_test_mode),
++                vsnd->capture_test_delay_ms);
++    return true;
++}
++
++static bool virtio_snd_capture_test_pause_configure(VirtIOSound *vsnd,
++                                                    Error **errp)
++{
++    const char *config =
++        g_getenv("QEMU_VIRTIO_SND_CAPTURE_TEST_PAUSE_AFTER");
++
++    if (!config || !*config || g_str_equal(config, "0")) {
++        return true;
++    }
++    if (!g_str_equal(config, "1")) {
++        error_setg(errp,
++                   "Invalid value in QEMU_VIRTIO_SND_CAPTURE_TEST_PAUSE_AFTER "
++                   "(expected 0 or 1)");
++        return false;
++    }
++    if (!vsnd->capture_test_delay_ms ||
++        vsnd->capture_test_mode != VIRTIO_SND_CAPTURE_TEST_SHORT_PACKED ||
++        vsnd->capture_test_count != 1 || vsnd->capture_test_after > 1) {
++        error_setg(errp,
++                   "QEMU_VIRTIO_SND_CAPTURE_TEST_PAUSE_AFTER=1 requires "
++                   "short-packed, after=0 or 1, count=1, and delay_ms");
++        return false;
++    }
++
++    vsnd->capture_test_pause_after = true;
++    info_report("virtio-snd capture-test pause-after enabled: "
++                "mode=short-packed after=%" PRIu32 " count=1 delay_ms=%" PRIu32,
++                vsnd->capture_test_after, vsnd->capture_test_delay_ms);
++    return true;
++}
++
+ static void virtio_snd_pcm_out_cb(void *data, int available);
+ static void virtio_snd_process_cmdq(VirtIOSound *s);
+ static void virtio_snd_pcm_flush(VirtIOSoundPCMStream *stream);
+ static void virtio_snd_pcm_in_cb(void *data, int available);
+ static void virtio_snd_unrealize(DeviceState *dev);
++static void virtio_snd_capture_test_delay_cb(void *opaque);
++static uint32_t virtio_snd_capture_test_queue_depth(
++    VirtIOSoundPCMStream *stream);
++static bool virtio_snd_capture_test_control_trace_allow(VirtIOSound *vsnd);
++static void virtio_snd_capture_test_delay_cancel_locked(VirtIOSound *vsnd,
++                                                         bool all,
++                                                         uint32_t stream_id);
+ 
+ static uint32_t supported_formats = BIT(VIRTIO_SND_PCM_FMT_S8)
+                                   | BIT(VIRTIO_SND_PCM_FMT_U8)
+@@ -699,6 +779,7 @@
+     VirtIOSoundPCMStream *stream;
+     virtio_snd_pcm_hdr req;
+     uint32_t stream_id;
++    int64_t request_ms;
+     size_t msg_sz = iov_to_buf(cmd->elem->out_sg,
+                                cmd->elem->out_num,
+                                0,
+@@ -714,26 +795,61 @@
+     }
+ 
+     stream_id = le32_to_cpu(req.stream_id);
++    request_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+     cmd->resp.code = cpu_to_le32(VIRTIO_SND_S_OK);
+     trace_virtio_snd_handle_pcm_start_stop(start ? "VIRTIO_SND_R_PCM_START" :
+             "VIRTIO_SND_R_PCM_STOP", stream_id);
+ 
+     stream = virtio_snd_pcm_get_stream(s, stream_id);
+     if (stream) {
++        bool held_for_delay;
++        bool active_before;
++        bool active_after;
++        uint32_t queue_depth;
++
++        qemu_mutex_lock(&s->capture_test_mutex);
++        if (!start) {
++            virtio_snd_capture_test_delay_cancel_locked(s, false, stream_id);
++        }
++        if (s->capture_test_pause_stream_id == stream_id) {
++            s->capture_test_rx_paused = false;
++            s->capture_test_pause_stream_id = UINT32_MAX;
++        }
++        held_for_delay = start && s->capture_test_delay_pending &&
++                         s->capture_test_delay_stream_id == stream_id;
+         WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
++            active_before = stream->active;
++            queue_depth = virtio_snd_capture_test_queue_depth(stream);
+             stream->active = start;
+-        }
+-        if (stream->info.direction == VIRTIO_SND_D_OUTPUT) {
+-            audio_be_set_active_out(s->audio_be, stream->voice.out, start);
+-        } else {
+-            audio_be_set_active_in(s->audio_be, stream->voice.in, start);
+-        }
++            active_after = stream->active;
++        }
++        if (!held_for_delay) {
++            if (stream->info.direction == VIRTIO_SND_D_OUTPUT) {
++                audio_be_set_active_out(s->audio_be, stream->voice.out, start);
++            } else {
++                audio_be_set_active_in(s->audio_be, stream->voice.in, start);
++            }
++        }
++        if (virtio_snd_capture_test_control_trace_allow(s)) {
++            info_report("virtio-snd capture-test trace: pcm-control"
++                        " op=%s stream=%" PRIu32 " request_ms=%" PRIi64
++                        " state_ms=%" PRIi64 " active_before=%d"
++                        " active_after=%d queue_depth=%" PRIu32
++                        " held_for_delay=%d delay_pending=%d"
++                        " delay_started=%d remaining=%" PRIu32,
++                        start ? "PCM_START" : "PCM_STOP", stream_id,
++                        request_ms, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
++                        active_before, active_after, queue_depth,
++                        held_for_delay, s->capture_test_delay_pending,
++                        s->capture_test_delay_started,
++                        s->capture_test_remaining);
++        }
++        qemu_mutex_unlock(&s->capture_test_mutex);
+     } else {
+         error_report("Invalid stream id: %"PRIu32, stream_id);
+         cmd->resp.code = cpu_to_le32(VIRTIO_SND_S_BAD_MSG);
+         return;
+     }
+-    stream->active = start;
+ }
+ 
+ /*
+@@ -765,6 +881,7 @@
+ {
+     uint32_t stream_id;
+     VirtIOSoundPCMStream *stream;
++    int64_t request_ms;
+     size_t msg_sz = iov_to_buf(cmd->elem->out_sg,
+                                cmd->elem->out_num,
+                                sizeof(virtio_snd_hdr),
+@@ -780,6 +897,7 @@
+     }
+ 
+     stream_id = le32_to_cpu(stream_id);
++    request_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+     trace_virtio_snd_handle_pcm_release(stream_id);
+     stream = virtio_snd_pcm_get_stream(s, stream_id);
+     if (stream == NULL) {
+@@ -791,6 +909,8 @@
+         return;
+     }
+ 
++    qemu_mutex_lock(&s->capture_test_mutex);
++    virtio_snd_capture_test_delay_cancel_locked(s, false, stream_id);
+     if (virtio_snd_pcm_get_io_msgs_count(stream)) {
+         /*
+          * virtio-v1.2-csd01, 5.14.6.6.5.1,
+@@ -804,6 +924,30 @@
+         trace_virtio_snd_pcm_stream_flush(stream_id);
+         virtio_snd_pcm_flush(stream);
+     }
++    if (s->capture_test_pause_stream_id == stream_id) {
++        s->capture_test_rx_paused = false;
++        s->capture_test_pause_stream_id = UINT32_MAX;
++    }
++    if (virtio_snd_capture_test_control_trace_allow(s)) {
++        bool active;
++        uint32_t queue_depth;
++
++        WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
++            active = stream->active;
++            queue_depth = virtio_snd_capture_test_queue_depth(stream);
++        }
++        info_report("virtio-snd capture-test trace: pcm-control"
++                    " op=PCM_RELEASE stream=%" PRIu32
++                    " request_ms=%" PRIi64 " state_ms=%" PRIi64
++                    " active=%d queue_depth=%" PRIu32
++                    " delay_pending=%d delay_started=%d remaining=%" PRIu32,
++                    stream_id, request_ms,
++                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), active, queue_depth,
++                    s->capture_test_delay_pending,
++                    s->capture_test_delay_started,
++                    s->capture_test_remaining);
++    }
++    qemu_mutex_unlock(&s->capture_test_mutex);
+ 
+     cmd->resp.code = cpu_to_le32(VIRTIO_SND_S_OK);
+ }
+@@ -1196,6 +1340,15 @@
+     uint32_t status;
+ 
+     trace_virtio_snd_realize(vsnd);
++    vsnd->capture_test_delay_ms = 0;
++    vsnd->capture_test_delay_stream_id = UINT32_MAX;
++    vsnd->capture_test_delay_pending = false;
++    vsnd->capture_test_delay_started = false;
++    vsnd->capture_test_shutting_down = false;
++    vsnd->capture_test_delay_timer = NULL;
++    vsnd->capture_test_pause_after = false;
++    vsnd->capture_test_rx_paused = false;
++    vsnd->capture_test_pause_stream_id = UINT32_MAX;
+ 
+     /* check number of jacks and streams */
+     if (vsnd->snd_conf.jacks > 8) {
+@@ -1218,13 +1371,20 @@
+         return;
+     }
+ 
+-    if (!virtio_snd_capture_test_configure(vsnd, errp)) {
++    if (!virtio_snd_capture_test_configure(vsnd, errp) ||
++        !virtio_snd_capture_test_delay_configure(vsnd, errp) ||
++        !virtio_snd_capture_test_pause_configure(vsnd, errp)) {
+         return;
+     }
+ 
+     if (!audio_be_check(&vsnd->audio_be, errp)) {
+         return;
+     }
++
++    qemu_mutex_init(&vsnd->capture_test_mutex);
++    vsnd->capture_test_delay_timer =
++        timer_new_ms(QEMU_CLOCK_VIRTUAL,
++                     virtio_snd_capture_test_delay_cb, vsnd);
+ 
+     vsnd->vmstate =
+         qemu_add_vm_change_state_handler(virtio_snd_vm_state_change, vsnd);
+@@ -1412,6 +1572,38 @@
+            vsnd->capture_test_seen >= vsnd->capture_test_after;
+ }
+ 
++static uint32_t virtio_snd_capture_test_queue_depth(
++    VirtIOSoundPCMStream *stream)
++{
++    VirtIOSoundPCMBuffer *buffer;
++    uint32_t depth = 0;
++
++    QSIMPLEQ_FOREACH(buffer, &stream->queue, entry) {
++        depth++;
++    }
++    return depth;
++}
++
++static bool virtio_snd_capture_test_trace_allow(VirtIOSound *vsnd)
++{
++    if (!vsnd->capture_test_delay_ms || !vsnd->capture_test_delay_started ||
++        vsnd->capture_test_trace_events >= 32) {
++        return false;
++    }
++    vsnd->capture_test_trace_events++;
++    return true;
++}
++
++static bool virtio_snd_capture_test_control_trace_allow(VirtIOSound *vsnd)
++{
++    if (!vsnd->capture_test_delay_ms ||
++        vsnd->capture_test_control_trace_events >= 16) {
++        return false;
++    }
++    vsnd->capture_test_control_trace_events++;
++    return true;
++}
++
+ static bool virtio_snd_capture_test_reply(VirtIOSoundPCMStream *stream,
+                                           VirtIOSoundPCMBuffer *buffer)
+ {
+@@ -1544,13 +1736,130 @@
+     info_report("virtio-snd capture-test reply: mode=%s stream=%" PRIu32
+                 " item=%" PRIu32 "/%" PRIu32 " after=%" PRIu32
+                 " seen=%" PRIu32 " audio=%zu used=%zu status=0x%08" PRIx32
+-                " remaining=%" PRIu32,
++                " remaining=%" PRIu32 " t_ms=%" PRIi64,
+                 virtio_snd_capture_test_mode_name(vsnd->capture_test_mode),
+                 stream->id, ordinal, vsnd->capture_test_count,
+                 vsnd->capture_test_after, vsnd->capture_test_seen,
+                 audio_bytes, used_len, status_code,
+-                vsnd->capture_test_remaining);
++                vsnd->capture_test_remaining,
++                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+     return true;
++}
++
++static void virtio_snd_capture_test_delay_cancel_locked(VirtIOSound *vsnd,
++                                                         bool all,
++                                                         uint32_t stream_id)
++{
++    if (!vsnd->capture_test_delay_pending ||
++        (!all && vsnd->capture_test_delay_stream_id != stream_id)) {
++        return;
++    }
++
++    timer_del(vsnd->capture_test_delay_timer);
++    vsnd->capture_test_delay_pending = false;
++    vsnd->capture_test_delay_stream_id = UINT32_MAX;
++    if (vsnd->capture_test_remaining) {
++        vsnd->capture_test_delay_started = false;
++    }
++}
++
++static void virtio_snd_capture_test_delay_cb(void *opaque)
++{
++    VirtIOSound *vsnd = opaque;
++    VirtIOSoundPCMStream *stream;
++    VirtIOSoundPCMBuffer *buffer;
++    bool response_attempted = false;
++    bool reactivate = false;
++    int64_t now_ms;
++
++    qemu_mutex_lock(&vsnd->capture_test_mutex);
++    if (!vsnd->capture_test_delay_pending ||
++        vsnd->capture_test_shutting_down) {
++        qemu_mutex_unlock(&vsnd->capture_test_mutex);
++        return;
++    }
++
++    now_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
++    info_report("virtio-snd capture-test trace: delay-expired t_ms=%" PRIi64
++                " elapsed_ms=%" PRIi64 " stream=%" PRIu32,
++                now_ms, now_ms - vsnd->capture_test_delay_armed_at_ms,
++                vsnd->capture_test_delay_stream_id);
++    stream = virtio_snd_pcm_get_stream(vsnd,
++                                      vsnd->capture_test_delay_stream_id);
++    if (stream) {
++        WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
++            reactivate = stream->active;
++            if (virtio_snd_capture_test_trace_allow(vsnd)) {
++                buffer = QSIMPLEQ_FIRST(&stream->queue);
++                info_report("virtio-snd capture-test trace: delay-queue"
++                            " t_ms=%" PRIi64 " active=%d depth=%" PRIu32
++                            " head_size=%zu due=%d ready=%d",
++                            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
++                            stream->active,
++                            virtio_snd_capture_test_queue_depth(stream),
++                            buffer ? buffer->size : 0,
++                            virtio_snd_capture_test_due(stream),
++                            buffer && virtio_queue_ready(buffer->vq));
++            }
++            if (stream->active && !QSIMPLEQ_EMPTY(&stream->queue)) {
++                buffer = QSIMPLEQ_FIRST(&stream->queue);
++                if (virtio_queue_ready(buffer->vq) &&
++                    virtio_snd_capture_test_due(stream)) {
++                    size_t input_size = iov_size(buffer->elem->in_sg,
++                                                 buffer->elem->in_num);
++                    size_t capacity = input_size >= sizeof(virtio_snd_pcm_status)
++                        ? input_size - sizeof(virtio_snd_pcm_status) : 0;
++
++                    info_report("virtio-snd capture-test delay expired: "
++                                "mode=%s stream=%" PRIu32 " delay_ms=%" PRIu32
++                                " capacity=%zu",
++                                virtio_snd_capture_test_mode_name(
++                                    vsnd->capture_test_mode),
++                                stream->id, vsnd->capture_test_delay_ms,
++                                capacity);
++                    response_attempted =
++                        virtio_snd_capture_test_reply(stream, buffer);
++                    if (response_attempted && vsnd->capture_test_pause_after) {
++                        vsnd->capture_test_rx_paused = true;
++                        vsnd->capture_test_pause_stream_id = stream->id;
++                        info_report("virtio-snd capture-test RX paused after "
++                                    "delayed reply: stream=%" PRIu32
++                                    " t_ms=%" PRIi64,
++                                    stream->id,
++                                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
++                    }
++                    if (response_attempted &&
++                        virtio_snd_capture_test_trace_allow(vsnd)) {
++                        buffer = QSIMPLEQ_FIRST(&stream->queue);
++                        info_report("virtio-snd capture-test trace: reply-done"
++                                    " t_ms=%" PRIi64 " depth=%" PRIu32
++                                    " head_size=%zu remaining=%" PRIu32,
++                                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
++                                    virtio_snd_capture_test_queue_depth(stream),
++                                    buffer ? buffer->size : 0,
++                                    vsnd->capture_test_remaining);
++                    }
++                }
++            }
++        }
++    }
++
++    vsnd->capture_test_delay_pending = false;
++    vsnd->capture_test_delay_stream_id = UINT32_MAX;
++    if (!response_attempted && vsnd->capture_test_remaining) {
++        vsnd->capture_test_delay_started = false;
++    }
++    if (reactivate && !vsnd->capture_test_shutting_down &&
++        !vsnd->capture_test_rx_paused) {
++        audio_be_set_active_in(vsnd->audio_be, stream->voice.in, true);
++        if (virtio_snd_capture_test_trace_allow(vsnd)) {
++            info_report("virtio-snd capture-test trace: backend-reactivated"
++                        " t_ms=%" PRIi64 " stream=%" PRIu32 " active=%d",
++                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), stream->id,
++                        stream->active);
++        }
++    }
++    qemu_mutex_unlock(&vsnd->capture_test_mutex);
+ }
+ 
+ 
+@@ -1563,21 +1872,73 @@
+ static void virtio_snd_pcm_in_cb(void *data, int available)
+ {
+     VirtIOSoundPCMStream *stream = data;
++    VirtIOSound *vsnd = stream->s;
+     VirtIOSoundPCMBuffer *buffer;
+-    size_t size, max_size, to_read;
++    size_t size, max_size, to_read, delayed_capacity = 0;
++    bool capture_test_mutex_locked = false;
++    bool start_delay = false;
++
++    if (vsnd->capture_test_delay_ms) {
++        qemu_mutex_lock(&vsnd->capture_test_mutex);
++        capture_test_mutex_locked = true;
++        if (vsnd->capture_test_delay_pending ||
++            vsnd->capture_test_shutting_down ||
++            (vsnd->capture_test_rx_paused &&
++             vsnd->capture_test_pause_stream_id == stream->id)) {
++            if (virtio_snd_capture_test_trace_allow(vsnd)) {
++                info_report("virtio-snd capture-test trace: rx-suppressed"
++                            " t_ms=%" PRIi64 " available=%d pending=%d"
++                            " shutting_down=%d stream=%" PRIu32,
++                            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), available,
++                            vsnd->capture_test_delay_pending,
++                            vsnd->capture_test_shutting_down, stream->id);
++            }
++            qemu_mutex_unlock(&vsnd->capture_test_mutex);
++            return;
++        }
++    }
+ 
+     WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
++        if (virtio_snd_capture_test_trace_allow(vsnd)) {
++            buffer = QSIMPLEQ_FIRST(&stream->queue);
++            info_report("virtio-snd capture-test trace: rx-callback"
++                        " t_ms=%" PRIi64 " available=%d active=%d"
++                        " depth=%" PRIu32 " head_size=%zu period_bytes=%" PRIu32,
++                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), available,
++                        stream->active,
++                        virtio_snd_capture_test_queue_depth(stream),
++                        buffer ? buffer->size : 0, stream->params.period_bytes);
++        }
+         while (!QSIMPLEQ_EMPTY(&stream->queue)) {
+             buffer = QSIMPLEQ_FIRST(&stream->queue);
+             if (!virtio_queue_ready(buffer->vq)) {
+-                return;
++                break;
+             }
+             if (!stream->active) {
+                 /* Stream has stopped, so do not perform audio_be_read. */
++                if (virtio_snd_capture_test_trace_allow(vsnd)) {
++                    info_report("virtio-snd capture-test trace: rx-inactive"
++                                " t_ms=%" PRIi64 " buffer_size=%zu",
++                                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
++                                buffer->size);
++                }
+                 return_rx_buffer(stream, buffer);
+                 continue;
+             }
+ 
++            if (vsnd->capture_test_delay_ms &&
++                !vsnd->capture_test_delay_started &&
++                virtio_snd_capture_test_due(stream)) {
++                vsnd->capture_test_delay_pending = true;
++                vsnd->capture_test_delay_started = true;
++                vsnd->capture_test_delay_stream_id = stream->id;
++                max_size = iov_size(buffer->elem->in_sg,
++                                    buffer->elem->in_num);
++                delayed_capacity = max_size >= sizeof(virtio_snd_pcm_status)
++                    ? max_size - sizeof(virtio_snd_pcm_status) : 0;
++                start_delay = true;
++                break;
++            }
+             if (virtio_snd_capture_test_due(stream) &&
+                 virtio_snd_capture_test_reply(stream, buffer)) {
+                 continue;
+@@ -1596,6 +1957,21 @@
+                             VIRTIO_SND_CAPTURE_TEST_NONE &&
+                         buffer->size == max_size) {
+                         stream->s->capture_test_seen++;
++                        if (vsnd->capture_test_pause_after) {
++                            info_report("virtio-snd capture-test full reply: "
++                                        "stream=%" PRIu32 " bytes=%zu"
++                                        " seen=%" PRIu32 " t_ms=%" PRIi64,
++                                        stream->id, buffer->size,
++                                        vsnd->capture_test_seen,
++                                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
++                        }
++                    }
++                    if (virtio_snd_capture_test_trace_allow(vsnd)) {
++                        info_report("virtio-snd capture-test trace: rx-complete"
++                                    " t_ms=%" PRIi64 " bytes=%zu reason=capacity"
++                                    " period_bytes=%" PRIu32,
++                                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
++                                    buffer->size, stream->params.period_bytes);
+                     }
+                     return_rx_buffer(stream, buffer);
+                     break;
+@@ -1607,6 +1983,15 @@
+                                      stream->voice.in,
+                                      buffer->data + buffer->size,
+                                      to_read);
++                if (virtio_snd_capture_test_trace_allow(vsnd)) {
++                    info_report("virtio-snd capture-test trace: rx-read"
++                                " t_ms=%" PRIi64 " request=%zu got=%zu"
++                                " available_before=%d buffer_size_before=%zu"
++                                " period_bytes=%" PRIu32,
++                                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), to_read,
++                                size, available, buffer->size,
++                                stream->params.period_bytes);
++                }
+                 if (!size) {
+                     available = 0;
+                     break;
+@@ -1618,6 +2003,21 @@
+                             VIRTIO_SND_CAPTURE_TEST_NONE &&
+                         buffer->size == max_size) {
+                         stream->s->capture_test_seen++;
++                        if (vsnd->capture_test_pause_after) {
++                            info_report("virtio-snd capture-test full reply: "
++                                        "stream=%" PRIu32 " bytes=%zu"
++                                        " seen=%" PRIu32 " t_ms=%" PRIi64,
++                                        stream->id, buffer->size,
++                                        vsnd->capture_test_seen,
++                                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
++                        }
++                    }
++                    if (virtio_snd_capture_test_trace_allow(vsnd)) {
++                        info_report("virtio-snd capture-test trace: rx-complete"
++                                    " t_ms=%" PRIi64 " bytes=%zu reason=period"
++                                    " period_bytes=%" PRIu32,
++                                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
++                                    buffer->size, stream->params.period_bytes);
+                     }
+                     return_rx_buffer(stream, buffer);
+                     break;
+@@ -1630,6 +2030,38 @@
+                 break;
+             }
+         }
++        if (virtio_snd_capture_test_trace_allow(vsnd)) {
++            buffer = QSIMPLEQ_FIRST(&stream->queue);
++            info_report("virtio-snd capture-test trace: rx-callback-end"
++                        " t_ms=%" PRIi64 " available=%d active=%d"
++                        " depth=%" PRIu32 " head_size=%zu",
++                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), available,
++                        stream->active,
++                        virtio_snd_capture_test_queue_depth(stream),
++                        buffer ? buffer->size : 0);
++        }
++    }
++
++    if (start_delay) {
++        /* Stop backend accumulation only after releasing queue_mutex. */
++        audio_be_set_active_in(vsnd->audio_be, stream->voice.in, false);
++        vsnd->capture_test_delay_armed_at_ms =
++            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
++        timer_mod(vsnd->capture_test_delay_timer,
++                     vsnd->capture_test_delay_armed_at_ms +
++                     vsnd->capture_test_delay_ms);
++        info_report("virtio-snd capture-test delay armed: mode=%s "
++                    "stream=%" PRIu32 " delay_ms=%" PRIu32
++                    " capacity=%zu descriptor=queued t_ms=%" PRIi64
++                    " deadline_ms=%" PRIi64,
++                    virtio_snd_capture_test_mode_name(vsnd->capture_test_mode),
++                    stream->id, vsnd->capture_test_delay_ms,
++                    delayed_capacity, vsnd->capture_test_delay_armed_at_ms,
++                    vsnd->capture_test_delay_armed_at_ms +
++                    vsnd->capture_test_delay_ms);
++    }
++    if (capture_test_mutex_locked) {
++        qemu_mutex_unlock(&vsnd->capture_test_mutex);
+     }
+ }
+ 
+@@ -1659,6 +2091,15 @@
+     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+     VirtIOSound *vsnd = VIRTIO_SND(dev);
+     VirtIOSoundPCMStream *stream;
++
++    qemu_mutex_lock(&vsnd->capture_test_mutex);
++    vsnd->capture_test_shutting_down = true;
++    virtio_snd_capture_test_delay_cancel_locked(vsnd, true, 0);
++    vsnd->capture_test_rx_paused = true;
++    vsnd->capture_test_pause_stream_id = UINT32_MAX;
++    qemu_mutex_unlock(&vsnd->capture_test_mutex);
++    timer_free(vsnd->capture_test_delay_timer);
++    vsnd->capture_test_delay_timer = NULL;
+ 
+     qemu_del_vm_change_state_handler(vsnd->vmstate);
+     trace_virtio_snd_unrealize(vsnd);
+@@ -1682,6 +2123,7 @@
+     virtio_delete_queue(vsnd->queues[VIRTIO_SND_VQ_TX]);
+     virtio_delete_queue(vsnd->queues[VIRTIO_SND_VQ_RX]);
+     virtio_cleanup(vdev);
++    qemu_mutex_destroy(&vsnd->capture_test_mutex);
+ }
+ 
+ 
+@@ -1689,6 +2131,12 @@
+ {
+     VirtIOSound *vsnd = VIRTIO_SND(vdev);
+     virtio_snd_ctrl_command *cmd;
++
++    qemu_mutex_lock(&vsnd->capture_test_mutex);
++    virtio_snd_capture_test_delay_cancel_locked(vsnd, true, 0);
++    vsnd->capture_test_rx_paused = false;
++    vsnd->capture_test_pause_stream_id = UINT32_MAX;
++    qemu_mutex_unlock(&vsnd->capture_test_mutex);
+ 
+     /*
+      * Sanity check that the invalid buffer message queue is emptied at the end
+--- a/include/hw/audio/virtio-snd.h
++++ b/include/hw/audio/virtio-snd.h
+@@ -18,6 +18,7 @@
+ 
+ #include "hw/virtio/virtio.h"
+ #include "qemu/audio.h"
++#include "qemu/timer.h"
+ #include "standard-headers/linux/virtio_ids.h"
+ #include "standard-headers/linux/virtio_snd.h"
+ 
+@@ -241,6 +242,20 @@
+     uint32_t capture_test_count;
+     uint32_t capture_test_seen;
+     uint32_t capture_test_remaining;
++    /* One-shot delayed short response state, guarded by capture_test_mutex. */
++    QemuMutex capture_test_mutex;
++    QEMUTimer *capture_test_delay_timer;
++    uint32_t capture_test_delay_ms;
++    uint32_t capture_test_delay_stream_id;
++    int64_t capture_test_delay_armed_at_ms;
++    uint32_t capture_test_trace_events;
++    uint32_t capture_test_control_trace_events;
++    bool capture_test_delay_pending;
++    bool capture_test_delay_started;
++    bool capture_test_shutting_down;
++    bool capture_test_pause_after;
++    bool capture_test_rx_paused;
++    uint32_t capture_test_pause_stream_id;
+     /*
+      * Convenience queue to keep track of invalid tx/rx queue messages inside
+      * the tx/rx callbacks.

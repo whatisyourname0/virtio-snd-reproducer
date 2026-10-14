@@ -1,0 +1,408 @@
+--- a/hw/audio/virtio-snd.c
++++ b/hw/audio/virtio-snd.c
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/cutils.h"
+ #include "qemu/iov.h"
+ #include "qemu/log.h"
+ #include "qemu/error-report.h"
+@@ -30,6 +31,157 @@
+ #define VIRTIO_SOUND_STREAM_DEFAULT 2
+ #define VIRTIO_SOUND_CHMAP_DEFAULT 0
+ #define VIRTIO_SOUND_HDA_FN_NID 0
++#define VIRTIO_SND_CAPTURE_TEST_LIMIT 4096
++
++static const char *virtio_snd_capture_test_mode_name(
++    VirtIOSoundCaptureTestMode mode)
++{
++    switch (mode) {
++    case VIRTIO_SND_CAPTURE_TEST_FULL_FIXED:
++        return "full-fixed";
++    case VIRTIO_SND_CAPTURE_TEST_SHORT_FIXED:
++        return "short-fixed";
++    case VIRTIO_SND_CAPTURE_TEST_SHORT_PACKED:
++        return "short-packed";
++    case VIRTIO_SND_CAPTURE_TEST_SHORT_STRADDLE:
++        return "short-straddle";
++    case VIRTIO_SND_CAPTURE_TEST_EMPTY_FIXED:
++        return "empty-fixed";
++    case VIRTIO_SND_CAPTURE_TEST_EMPTY_PACKED:
++        return "empty-packed";
++    case VIRTIO_SND_CAPTURE_TEST_USED_SHORT:
++        return "used-short";
++    case VIRTIO_SND_CAPTURE_TEST_USED_OVER:
++        return "used-over";
++    case VIRTIO_SND_CAPTURE_TEST_MISALIGNED:
++        return "misaligned";
++    case VIRTIO_SND_CAPTURE_TEST_BAD_STATUS:
++        return "bad-status";
++    case VIRTIO_SND_CAPTURE_TEST_NONE:
++    default:
++        return "disabled";
++    }
++}
++
++static bool virtio_snd_capture_test_parse_u32(const char *key,
++                                              const char *text,
++                                              uint32_t *value,
++                                              Error **errp)
++{
++    uint64_t parsed;
++    const char *end;
++
++    if (!*text || qemu_strtou64(text, &end, 10, &parsed) || *end ||
++        parsed > VIRTIO_SND_CAPTURE_TEST_LIMIT) {
++        error_setg(errp, "Invalid %s value in QEMU_VIRTIO_SND_CAPTURE_TEST",
++                   key);
++        return false;
++    }
++    *value = parsed;
++    return true;
++}
++
++static bool virtio_snd_capture_test_configure(VirtIOSound *vsnd,
++                                               Error **errp)
++{
++    const char *config = g_getenv("QEMU_VIRTIO_SND_CAPTURE_TEST");
++    g_auto(GStrv) tokens = NULL;
++    bool have_after = false, have_count = false, valid = true;
++    size_t i;
++
++    if (!config || !*config) {
++        return true;
++    }
++
++    tokens = g_strsplit(config, ",", -1);
++    g_strstrip(tokens[0]);
++    if (!tokens[0] || !*tokens[0]) {
++        error_setg(errp, "Empty mode in QEMU_VIRTIO_SND_CAPTURE_TEST");
++        return false;
++    }
++
++    if (g_str_equal(tokens[0], "full-fixed")) {
++        vsnd->capture_test_mode = VIRTIO_SND_CAPTURE_TEST_FULL_FIXED;
++    } else if (g_str_equal(tokens[0], "short-fixed")) {
++        vsnd->capture_test_mode = VIRTIO_SND_CAPTURE_TEST_SHORT_FIXED;
++    } else if (g_str_equal(tokens[0], "short-packed")) {
++        vsnd->capture_test_mode = VIRTIO_SND_CAPTURE_TEST_SHORT_PACKED;
++    } else if (g_str_equal(tokens[0], "short-straddle")) {
++        vsnd->capture_test_mode = VIRTIO_SND_CAPTURE_TEST_SHORT_STRADDLE;
++    } else if (g_str_equal(tokens[0], "empty-fixed")) {
++        vsnd->capture_test_mode = VIRTIO_SND_CAPTURE_TEST_EMPTY_FIXED;
++    } else if (g_str_equal(tokens[0], "empty-packed")) {
++        vsnd->capture_test_mode = VIRTIO_SND_CAPTURE_TEST_EMPTY_PACKED;
++    } else if (g_str_equal(tokens[0], "used-short")) {
++        vsnd->capture_test_mode = VIRTIO_SND_CAPTURE_TEST_USED_SHORT;
++    } else if (g_str_equal(tokens[0], "used-over")) {
++        vsnd->capture_test_mode = VIRTIO_SND_CAPTURE_TEST_USED_OVER;
++    } else if (g_str_equal(tokens[0], "misaligned")) {
++        vsnd->capture_test_mode = VIRTIO_SND_CAPTURE_TEST_MISALIGNED;
++    } else if (g_str_equal(tokens[0], "bad-status")) {
++        vsnd->capture_test_mode = VIRTIO_SND_CAPTURE_TEST_BAD_STATUS;
++    } else {
++        error_setg(errp, "Unknown mode '%s' in QEMU_VIRTIO_SND_CAPTURE_TEST",
++                   tokens[0]);
++        return false;
++    }
++
++    vsnd->capture_test_count = 1;
++    for (i = 1; tokens[i]; i++) {
++        char *equals = strchr(tokens[i], '=');
++        uint32_t parsed;
++        const char *key, *value;
++
++        if (!equals) {
++            error_setg(errp,
++                       "Expected key=value in "
++                       "QEMU_VIRTIO_SND_CAPTURE_TEST");
++            valid = false;
++            break;
++        }
++        *equals = '\0';
++        key = g_strstrip(tokens[i]);
++        value = g_strstrip(equals + 1);
++        if (g_str_equal(key, "after") && !have_after) {
++            have_after = true;
++            valid = virtio_snd_capture_test_parse_u32(key, value, &parsed,
++                                                       errp);
++            if (valid) {
++                vsnd->capture_test_after = (uint32_t)parsed;
++            }
++        } else if (g_str_equal(key, "count") && !have_count) {
++            have_count = true;
++            valid = virtio_snd_capture_test_parse_u32(key, value, &parsed,
++                                                       errp);
++            if (valid && parsed) {
++                vsnd->capture_test_count = (uint32_t)parsed;
++            } else if (valid) {
++                error_setg(errp,
++                           "count must be greater than zero in "
++                           "QEMU_VIRTIO_SND_CAPTURE_TEST");
++                valid = false;
++            }
++        } else {
++            error_setg(errp,
++                       "Unknown or duplicate key '%s' in "
++                       "QEMU_VIRTIO_SND_CAPTURE_TEST",
++                       key);
++            valid = false;
++        }
++        if (!valid) {
++            break;
++        }
++    }
++
++    if (valid) {
++        vsnd->capture_test_remaining = vsnd->capture_test_count;
++        info_report("virtio-snd capture-test enabled: mode=%s after=%" PRIu32
++                    " count=%" PRIu32,
++                    virtio_snd_capture_test_mode_name(vsnd->capture_test_mode),
++                    vsnd->capture_test_after, vsnd->capture_test_count);
++    }
++    return valid;
++}
+ 
+ static void virtio_snd_pcm_out_cb(void *data, int available);
+ static void virtio_snd_process_cmdq(VirtIOSound *s);
+@@ -1063,6 +1215,10 @@
+         error_setg(errp,
+                    "Invalid number of channel maps: %"PRIu32,
+                    vsnd->snd_conf.chmaps);
++        return;
++    }
++
++    if (!virtio_snd_capture_test_configure(vsnd, errp)) {
+         return;
+     }
+ 
+@@ -1247,6 +1403,156 @@
+     virtio_snd_pcm_buffer_free(buffer);
+ }
+ 
++static bool virtio_snd_capture_test_due(VirtIOSoundPCMStream *stream)
++{
++    VirtIOSound *vsnd = stream->s;
++
++    return vsnd->capture_test_mode != VIRTIO_SND_CAPTURE_TEST_NONE &&
++           vsnd->capture_test_remaining &&
++           vsnd->capture_test_seen >= vsnd->capture_test_after;
++}
++
++static bool virtio_snd_capture_test_reply(VirtIOSoundPCMStream *stream,
++                                          VirtIOSoundPCMBuffer *buffer)
++{
++    VirtIOSound *vsnd = stream->s;
++    virtio_snd_pcm_status status = { 0 };
++    size_t input_size = iov_size(buffer->elem->in_sg,
++                                 buffer->elem->in_num);
++    size_t capacity, frame_bytes, audio_bytes = 0, status_offset, used_len;
++    uint32_t status_code = VIRTIO_SND_S_OK;
++    bool packed = false;
++    uint32_t ordinal = vsnd->capture_test_count -
++                       vsnd->capture_test_remaining + 1;
++
++    if (input_size < sizeof(status)) {
++        error_report("virtio-snd capture-test: input SG smaller than status");
++        vsnd->capture_test_remaining = 0;
++        return false;
++    }
++    capacity = input_size - sizeof(status);
++    frame_bytes = (audio_format_bits(stream->as.fmt) / 8) *
++                  stream->as.nchannels;
++    if (!frame_bytes || capacity > UINT_MAX - sizeof(status) - 1) {
++        error_report("virtio-snd capture-test: invalid capacity or frame size");
++        vsnd->capture_test_remaining = 0;
++        return false;
++    }
++
++    switch (vsnd->capture_test_mode) {
++    case VIRTIO_SND_CAPTURE_TEST_FULL_FIXED:
++    case VIRTIO_SND_CAPTURE_TEST_USED_OVER:
++    case VIRTIO_SND_CAPTURE_TEST_USED_SHORT:
++        audio_bytes = capacity;
++        break;
++    case VIRTIO_SND_CAPTURE_TEST_SHORT_FIXED:
++    case VIRTIO_SND_CAPTURE_TEST_SHORT_PACKED:
++        audio_bytes = capacity - capacity % frame_bytes;
++        if (audio_bytes >= frame_bytes) {
++            audio_bytes -= frame_bytes;
++        }
++        if (!audio_bytes) {
++            error_report("virtio-snd capture-test: short response requires "
++                         "at least two frames of capacity");
++            vsnd->capture_test_remaining = 0;
++            return false;
++        }
++        packed = vsnd->capture_test_mode ==
++                 VIRTIO_SND_CAPTURE_TEST_SHORT_PACKED;
++        break;
++    case VIRTIO_SND_CAPTURE_TEST_SHORT_STRADDLE:
++        if (stream->as.fmt != AUDIO_FORMAT_S16 ||
++            stream->as.nchannels != 1 || frame_bytes != 2 ||
++            capacity < 4 || capacity % 2) {
++            error_report("virtio-snd capture-test: short-straddle requires "
++                         "mono S16 and an even capacity");
++            vsnd->capture_test_remaining = 0;
++            return false;
++        }
++        audio_bytes = capacity - 4;
++        packed = true;
++        break;
++    case VIRTIO_SND_CAPTURE_TEST_EMPTY_FIXED:
++    case VIRTIO_SND_CAPTURE_TEST_EMPTY_PACKED:
++        packed = vsnd->capture_test_mode ==
++                 VIRTIO_SND_CAPTURE_TEST_EMPTY_PACKED;
++        break;
++    case VIRTIO_SND_CAPTURE_TEST_MISALIGNED:
++        audio_bytes = capacity - capacity % frame_bytes;
++        if (audio_bytes) {
++            audio_bytes--;
++        }
++        if (!audio_bytes || audio_bytes % frame_bytes == 0) {
++            error_report("virtio-snd capture-test: cannot form "
++                         "misaligned payload");
++            vsnd->capture_test_remaining = 0;
++            return false;
++        }
++        break;
++    case VIRTIO_SND_CAPTURE_TEST_BAD_STATUS:
++        audio_bytes = capacity;
++        status_code = VIRTIO_SND_S_BAD_MSG;
++        break;
++    case VIRTIO_SND_CAPTURE_TEST_NONE:
++    default:
++        return false;
++    }
++
++    if (audio_bytes > capacity) {
++        error_report("virtio-snd capture-test: payload exceeds data SG");
++        vsnd->capture_test_remaining = 0;
++        return false;
++    }
++
++    memset(buffer->data, 0x5a, audio_bytes);
++    if (audio_bytes &&
++        iov_from_buf(buffer->elem->in_sg, buffer->elem->in_num, 0,
++                     buffer->data, audio_bytes) != audio_bytes) {
++        error_report("virtio-snd capture-test: short PCM SG write");
++        vsnd->capture_test_remaining = 0;
++        return false;
++    }
++
++    status.status = cpu_to_le32(status_code);
++    status.latency_bytes = 0;
++    status_offset = packed ? audio_bytes : capacity;
++    if (iov_from_buf(buffer->elem->in_sg, buffer->elem->in_num,
++                     status_offset, &status, sizeof(status)) !=
++        sizeof(status)) {
++        error_report("virtio-snd capture-test: short status SG write");
++        vsnd->capture_test_remaining = 0;
++        return false;
++    }
++
++    switch (vsnd->capture_test_mode) {
++    case VIRTIO_SND_CAPTURE_TEST_USED_SHORT:
++        used_len = sizeof(status) - 1;
++        break;
++    case VIRTIO_SND_CAPTURE_TEST_USED_OVER:
++        used_len = capacity + sizeof(status) + 1;
++        break;
++    default:
++        used_len = audio_bytes + sizeof(status);
++        break;
++    }
++
++    virtqueue_push(buffer->vq, buffer->elem, (uint32_t)used_len);
++    virtio_notify(VIRTIO_DEVICE(stream->s), buffer->vq);
++    QSIMPLEQ_REMOVE(&stream->queue, buffer, VirtIOSoundPCMBuffer, entry);
++    virtio_snd_pcm_buffer_free(buffer);
++    vsnd->capture_test_remaining--;
++    info_report("virtio-snd capture-test reply: mode=%s stream=%" PRIu32
++                " item=%" PRIu32 "/%" PRIu32 " after=%" PRIu32
++                " seen=%" PRIu32 " audio=%zu used=%zu status=0x%08" PRIx32
++                " remaining=%" PRIu32,
++                virtio_snd_capture_test_mode_name(vsnd->capture_test_mode),
++                stream->id, ordinal, vsnd->capture_test_count,
++                vsnd->capture_test_after, vsnd->capture_test_seen,
++                audio_bytes, used_len, status_code,
++                vsnd->capture_test_remaining);
++    return true;
++}
++
+ 
+ /*
+  * audio_be_* input callback.
+@@ -1272,6 +1578,11 @@
+                 continue;
+             }
+ 
++            if (virtio_snd_capture_test_due(stream) &&
++                virtio_snd_capture_test_reply(stream, buffer)) {
++                continue;
++            }
++
+             max_size = iov_size(buffer->elem->in_sg, buffer->elem->in_num);
+             if (max_size <= sizeof(virtio_snd_pcm_status)) {
+                 return_rx_buffer(stream, buffer);
+@@ -1281,6 +1592,11 @@
+ 
+             for (;;) {
+                 if (buffer->size >= max_size) {
++                    if (stream->s->capture_test_mode !=
++                            VIRTIO_SND_CAPTURE_TEST_NONE &&
++                        buffer->size == max_size) {
++                        stream->s->capture_test_seen++;
++                    }
+                     return_rx_buffer(stream, buffer);
+                     break;
+                 }
+@@ -1298,6 +1614,11 @@
+                 buffer->size += size;
+                 available -= size;
+                 if (buffer->size >= stream->params.period_bytes) {
++                    if (stream->s->capture_test_mode !=
++                            VIRTIO_SND_CAPTURE_TEST_NONE &&
++                        buffer->size == max_size) {
++                        stream->s->capture_test_seen++;
++                    }
+                     return_rx_buffer(stream, buffer);
+                     break;
+                 }
+--- a/include/hw/audio/virtio-snd.h
++++ b/include/hw/audio/virtio-snd.h
+@@ -78,6 +78,20 @@
+ typedef struct VirtIOSoundPCM VirtIOSoundPCM;
+ 
+ typedef struct VirtIOSoundPCMBuffer VirtIOSoundPCMBuffer;
++
++typedef enum VirtIOSoundCaptureTestMode {
++    VIRTIO_SND_CAPTURE_TEST_NONE,
++    VIRTIO_SND_CAPTURE_TEST_FULL_FIXED,
++    VIRTIO_SND_CAPTURE_TEST_SHORT_FIXED,
++    VIRTIO_SND_CAPTURE_TEST_SHORT_PACKED,
++    VIRTIO_SND_CAPTURE_TEST_SHORT_STRADDLE,
++    VIRTIO_SND_CAPTURE_TEST_EMPTY_FIXED,
++    VIRTIO_SND_CAPTURE_TEST_EMPTY_PACKED,
++    VIRTIO_SND_CAPTURE_TEST_USED_SHORT,
++    VIRTIO_SND_CAPTURE_TEST_USED_OVER,
++    VIRTIO_SND_CAPTURE_TEST_MISALIGNED,
++    VIRTIO_SND_CAPTURE_TEST_BAD_STATUS,
++} VirtIOSoundCaptureTestMode;
+ 
+ /*
+  * The VirtIO sound spec reuses layouts and values from the High Definition
+@@ -221,6 +235,12 @@
+     QemuMutex cmdq_mutex;
+     QTAILQ_HEAD(, virtio_snd_ctrl_command) cmdq;
+     bool processing_cmdq;
++    /* One-shot synthetic capture responses for local guest-parser testing. */
++    VirtIOSoundCaptureTestMode capture_test_mode;
++    uint32_t capture_test_after;
++    uint32_t capture_test_count;
++    uint32_t capture_test_seen;
++    uint32_t capture_test_remaining;
+     /*
+      * Convenience queue to keep track of invalid tx/rx queue messages inside
+      * the tx/rx callbacks.

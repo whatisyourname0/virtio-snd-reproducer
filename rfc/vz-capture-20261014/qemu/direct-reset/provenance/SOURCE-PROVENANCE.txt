@@ -1,0 +1,53 @@
+# Direct control timeout and reset fixture provenance
+
+## QEMU source and patch stack
+
+The pinned source is the official QEMU 11.1.2 release archive `qemu-11.1.2.tar.xz`.
+Its SHA-256 is `731b5681e4bb18be313231579b8efd0296c5b015fa36dc533874b639ba838016`.
+
+The pristine source-file hashes verified by the shared QEMU build helper are:
+
+- `hw/audio/virtio-snd.c`: `fe33f3fdf897c98cb1cceae49121f0d28ea3ae783523c41e8a9b9a3af37ec821`
+- `include/hw/audio/virtio-snd.h`: `23ed716769ced2f13b54a38f32d56172183ddc858dd476c98217b2823502d53e`
+
+Apply the following patches in order:
+
+1. `../patches/qemu-capture-faults.patch` — SHA-256 `588a804dec095cbd88534c7236cc9a832ab6dc948ffaec262db8529e725c4349`
+2. `../patches/qemu-capture-drain-r1.patch` — SHA-256 `be4d923a8401bf60620c71f9702f59ab4332a16c084975880936cc08698ecdfd`
+3. `../patches/qemu-fsm-control-delay.patch` — SHA-256 `f11e9b7a6ffda0eb860c03c6fea6617931e8954a2bab612c642307aa4d294cf1`
+4. `patches/qemu-direct-reset-cancel.patch` — SHA-256 `04bb339fdce47bc6b02073fb6eb5a2ff2d78bf9f69224aedad8812155080c6f8`
+
+The direct reset delta exposes synthetic hold/counter properties for control and capture descriptors.
+Its reset callback cancels and detaches held descriptors, releases stream-queued descriptors while marking streams inactive, deactivates audio outside the queue lock, and detaches queued control descriptors.
+This reset cleanup is part of the backend under test; the result does not establish unmodified-QEMU reset behavior.
+
+The shared build helper validates pristine QEMU source hashes and applies the first three fixture patches before accepting this package's patch as its final `--extra-patch`.
+The helper builds only `aarch64-softmmu` and does not ship the QEMU binary.
+
+## Patched source identity
+
+The four patches were replayed in order on the pinned archive with `patch --fuzz=0 -p1`; every hunk applied without fuzz.
+The resulting `hw/audio/virtio-snd.c` SHA-256 is `5bbf46f166484090c189735b270e0721435dcbc671304e6ddd96f6f6280639c8`.
+The resulting `include/hw/audio/virtio-snd.h` SHA-256 is `87ded6790c7b1f8c180124dd0592ded6e3dd7ee7a75cc098652d55f88daf5b4d`.
+The external validation build's QEMU binary SHA-256 is `9c15ad137a237ec8541e646d99ba1e41f33c9d4b38baf5e913eaed634411f424`; runtime artifacts and replay commands remain outside this source bundle.
+
+## Runtime input identity
+
+`scripts/build-runtime-manifest.py` writes a path-independent manifest for the `qemu-system-aarch64` executable, matching KASAN `Image`, generated initrd, and sound modules.
+The required sound modules are `snd.ko`, `snd-timer.ko`, `snd-pcm.ko`, and `virtio_snd.ko` from one exact `lib/modules/<release>` directory.
+
+At run time, `support/runtime_inputs.py` verifies every manifest digest and requires QEMU 11.1.2.
+It rejects duplicate initrd members, compares packaged module bytes, and checks sound-module dependency indexes.
+The kernel release is an explicit CLI argument and must be one path component.
+
+The runner invokes the actual `speaker-test` PCM playback process.
+It measures SIGKILL-to-driver-timeout using two `/proc/uptime` samples in the same guest shell command, immediately before the signal and immediately after `wait` returns.
+The preserved acceptance interval is 0.75–5 seconds.
+Host monotonic time is a 20-second timeout hang guard and a diagnostic only.
+
+The delayed control timer uses `QEMU_CLOCK_VIRTUAL` with a 15-second hold.
+The runner proves guest uptime has passed that timer deadline by one additional second and confirms reset left `pending=0` and `completed=0`.
+A 60-second host guard detects a stuck guest without substituting host time for the virtual-time deadline.
+
+This source package includes no QEMU executable, kernel, module tree, rootfs, initrd, runtime manifest, or test result.
+Generate those artifacts from explicit inputs and save fresh run logs outside this directory.

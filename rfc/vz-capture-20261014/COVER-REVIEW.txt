@@ -1,0 +1,25 @@
+RFC cover refresh: 2026-10-14
+
+All three covers distinguish the five already-submitted v3 patches from the
+four additional RFC patches. These supplement v3 rather than supersede it.
+Generic control-wait and the two core patches apply independently on v3;
+VZ compatibility requires all three. Both prerequisite orders reconstruct
+tree 00837d5f89e6a60afc8b96367ad298eae9df6c4d, matching the fresh kernel source.
+The four implementation patch hashes are unchanged from runtime validation.
+
+The covers disclose globally changed teardown waiting/core drain semantics,
+opt-in VZ controls, integrated synthetic proof, modified QEMU reset cleanup,
+retained overruns, and separate historical microphone evidence. Fresh build
+means the pinned local candidate, not a rebase onto a newer upstream tree.
+See qemu/VALIDATION-RESULTS.txt for exact build/runtime details.
+
+This revision changes covers/documentation only. Runtime sources, four RFC
+patches and five prerequisites are identical to the tested r2 archive.
+Its ten ordinary-TCG cases, 24 harness tests and relocated runtime checks
+remain the evidence; tests were not rerun for prose-only changes.
+
+This is a local review draft. Human authorship/DCO, a real bundle delivery
+reference, final recipients/thread headers, exact-file dry-run and a fresh
+review-status check remain pending. Public lore refresh returned HTTP 403;
+older bot replies do not establish current maintainer review or acceptance.
+No messages, uploads, pushes, commits or PRs were performed.

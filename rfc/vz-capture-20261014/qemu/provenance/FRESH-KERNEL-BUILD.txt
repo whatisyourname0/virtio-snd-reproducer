@@ -1,0 +1,142 @@
+# Fresh RFC candidate kernel build evidence
+
+## Result
+
+Status: successful fresh build from the source-only RFC candidate export. No
+objects, generated configuration, Image, or modules from a previous build were
+reused.
+
+The build ran as native linux/arm64 with four jobs. It used W=1, produced the
+ARM64 Image and runtime module tree, and completed modules_install and depmod.
+This record proves build and artifact checks only; separate QEMU/TCG runtime
+validation is coordinated outside this build record.
+
+## Source identity
+
+Source: local RFC candidate worktree; exact base and patch hashes below.
+HEAD: d58a3ac9b1719fdf8ce9d286be606128aeebf1aa
+The production worktree retained its eight existing dirty source files. Each
+was compared byte-for-byte with the corresponding candidate-export file before
+building:
+
+- sound/core/pcm_lib.c
+- sound/core/pcm_native.c
+- sound/virtio/virtio_ctl_msg.c
+- sound/virtio/virtio_ctl_msg.h
+- sound/virtio/virtio_pcm.c
+- sound/virtio/virtio_pcm.h
+- sound/virtio/virtio_pcm_msg.c
+- sound/virtio/virtio_pcm_ops.c
+
+The full source export was created with reproducer-ready/prepare-source.sh in
+candidate mode from base commit 8d70e364e866bdfca81eee24d0688fac9472cfb9. The
+script applies the five prerequisite patches followed by the four RFC patches.
+The production repository was not edited by this build task.
+
+Patch SHA-256 values:
+
+- prerequisites/0001-ALSA-virtio-Propagate-PCM-send-failures-through-A.patch
+  684ac74eac0250c9cf22a9519e05170531feaef465590f57cc6b0f343abe7a99
+- prerequisites/0002-ALSA-virtio-Recover-PCM-state-after-a-failed-star.patch
+  73f4c3029451065bc45287b41c43d958c5510736575196d25a98045cf1b7977c
+- prerequisites/0003-ALSA-virtio-Retain-queued-messages-through-device.patch
+  f9ef26a18ccfbc44a69cd26cb0fd1da7c82c9520f9588e5cc180746b7dc0ac46
+- prerequisites/0004-ALSA-virtio-Keep-PCM-DMA-buffers-alive-through-de.patch
+  493199e326ca5db826a21832710485c88830fe0c7b9c4115cd25d3e41ca072cb
+- prerequisites/0005-ALSA-virtio-Keep-control-payloads-alive-through-D.patch
+  9ac2f1a4f5141a5bfcfc5416519222bc18509943d16d4bc981cc24d49dd76c5f
+- rfc/generic-control-wait/0001-ALSA-virtio-wait-through-signals-for-PCM-teardown.patch
+  ff19fb721337e139bc86a91d6f4fa84278eeb884c5e92ccefa4bb65e3f4305aa
+- rfc/core-capture-drain/0001-ALSA-pcm-allow-capture-reads-while-draining.patch
+  6d1cb86d1d1878ffc94c56499e308d2b333b915b8b0ecaae4f5b34a2d5f1b577
+- rfc/core-capture-drain/0002-ALSA-pcm-refresh-capture-pointers-before-drain.patch
+  e0ce88ada0436ee38402fe7fe9f0f3778cb415ac8048e816042b2ee85df4fdca
+- rfc/vz-capture-compat/0001-ALSA-virtio-stage-VZ-capture-and-restart-paused-stre.patch
+  489fd2d9103a2008d3caabc3c3aba1c747df9d32ec12c4ae0f6de05da5192071
+
+The build-time source manifest contains 102,353 entries and has SHA-256
+c3dcfd2494a2903a84ad9f9af27dbc5e85d62efd13aebfd06b7c5028bf092d11. The host
+helper generated it before launch; the container recomputed and compared the
+entire manifest against the read-only source mount before running make.
+
+## Configuration and toolchain
+
+Config: reproducer-ready/qemu/configs/arm64-kasan-reference.config
+Config SHA-256: 371444ea45dd0f8cf98178872e2f44d8972ef11049b8ef9b3ff03861fd522e40
+The out-of-tree olddefconfig step reported “No change to .config”. The final
+kernel.config has ARM64, generic KASAN, modules, DEVTMPFS, SND, SND_TIMER,
+SND_PCM, and SND_VIRTIO enabled with the expected built-in/module values.
+
+Builder Dockerfile: reproducer-ready/qemu/Dockerfile.kernel-builder
+Pinned base: Alpine 3.22.6, sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+The Dockerfile adds the original kernel builder dependencies plus GNU coreutils
+and findutils. Rebuild command, run from reproducer-ready/qemu:
+
+docker build --platform linux/arm64 --file Dockerfile.kernel-builder --tag industrial-virtio-module-builder:alpine322-gnu .
+
+Builder reference: industrial-virtio-module-builder:alpine322-gnu
+Builder platform: linux/arm64
+Local builder image ID (not a published registry image):
+sha256:a9e10d85ce0d36e994088f7940ad8f6e8177eaf504158ad3241c79d6a3a8c001
+
+Recorded toolchain: GCC 14.2.0 (aarch64-alpine-linux-musl), GNU Make 4.4.1,
+GNU ld 2.44, coreutils 9.7-r1, and findutils 4.10.0-r0. Exact installed package
+and compiler records are in builder-packages.txt and toolchain.txt in the
+output directory. The build used SOURCE_DATE_EPOCH=1791936000 and fixed
+KBUILD_BUILD_USER, KBUILD_BUILD_HOST, and KBUILD_BUILD_TIMESTAMP values, all
+recorded in build-inputs.txt.
+
+## Build command and artifacts
+
+Output tree, outside the source bundle:
+/path/to/new-kernel-build
+
+Portable command template matching the completed build:
+
+/path/to/reproducer/qemu/scripts/build-kernel.sh --source /path/to/prepared-candidate --output /path/to/new-kernel-build --config /path/to/reproducer/qemu/configs/arm64-kasan-reference.config --jobs 4 --builder-image industrial-virtio-module-builder:alpine322-gnu
+
+Build target: make ARCH=arm64 W=1 -j4 Image modules
+Kernel release: 7.3.0-rc6-snd-lifetime-kasan
+Image size: 14,594,056 bytes
+Image SHA-256: f9fa333e464a439768bfcdfabb197315283ea6df0a2635b46892f9b0bd78c483
+
+The fresh module tree contains and passed vermagic/release checks for:
+
+- kernel/sound/core/snd.ko
+  SHA-256 d998c0c633ad34e67b667626978739ca2cfa0fadc502619fb1a5b0b95d3d55de
+- kernel/sound/core/snd-timer.ko
+  SHA-256 385691e1ef401d7ad3af514df3d4179360ceb9aba4f0652da37f131e85b7dc99
+- kernel/sound/core/snd-pcm.ko
+  SHA-256 43e30f65a00dc115347892c8303d31de9026a418669d720ba1185a874258fa0a
+- kernel/sound/virtio/virtio_snd.ko
+  SHA-256 1746573c45dc6baa717b98500aa0894384f93f09ce7cea2d40ab0b4e2a245d02
+
+modules_install succeeded. depmod exited successfully and generated
+modules.dep, modules.alias, modules.builtin, and modules.softdep. The depmod
+log is empty because depmod emitted no diagnostics. The required snd-pcm and
+virtio_snd dependency entries are present in modules.dep. The module tree
+manifest contains 28 entries and has SHA-256
+ae6f73fc6cc6423d92a9a861be1a37b9c956555a556afbe255b8aed0430745e2.
+Artifact hashes are recorded in artifact-sha256.txt; the complete build log is
+build.log.
+
+## Warning audit and failed attempt
+
+The completed W=1 build log has 517 compiler warnings, all -Woverride-init:
+473 from arch/arm64/kernel/sys.c and 44 from arch/arm64/kernel/traps.c. There
+were no warnings in the eight changed sound source paths, no compiler errors,
+no fatal errors, and no make failures. Both warning-bearing source files are
+unchanged from pinned base commit 8d70e364e866bdfca81eee24d0688fac9472cfb9:
+arch/arm64/kernel/sys.c has SHA-256
+f052e58e829fd4a977f7a52ce96a774051430c3a677e6d8b805694b8d466da9c, and
+arch/arm64/kernel/traps.c has SHA-256
+42a761c76c28a507e5f30c3e2d4045463dbc2655f4705a023b1379c75450ce95. The
+build log also includes two APK cache lookup warnings while recording package
+metadata; these are not compiler diagnostics and did not stop the build.
+
+An earlier, invalid partial attempt is preserved at
+validation/vz-compat-v3/fresh-rfc-candidate-kasan-20261014. It used the old
+BusyBox-only builder, logged unsupported date/find options, and was explicitly
+stopped with exit 137 before Image/module installation or depmod. Its
+INVALID-BUILD.txt marks it unusable. No artifact from that directory was used
+in the successful build above.

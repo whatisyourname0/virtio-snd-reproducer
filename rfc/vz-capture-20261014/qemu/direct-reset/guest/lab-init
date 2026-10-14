@@ -1,0 +1,59 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-only
+set -eu
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+
+release=$(uname -r)
+module_options=
+expected_parameters=
+for argument in $(cat /proc/cmdline); do
+    case "$argument" in
+        direct_reset.module_options=*) module_options=${argument#*=} ;;
+        direct_reset.expected_parameters=*) expected_parameters=${argument#*=} ;;
+    esac
+done
+
+modprobe -S "$release" snd
+modprobe -S "$release" snd_pcm
+if [ -n "$module_options" ]; then
+    saved_ifs=$IFS
+    IFS=,
+    set -- $module_options
+    IFS=$saved_ifs
+    modprobe -S "$release" virtio_snd "$@"
+else
+    modprobe -S "$release" virtio_snd
+fi
+
+if [ -n "$expected_parameters" ]; then
+    saved_ifs=$IFS
+    IFS=,
+    set -- $expected_parameters
+    IFS=$saved_ifs
+    for expected in "$@"; do
+        parameter=${expected%%=*}
+        expected_value=${expected#*=}
+        actual_value=$(cat "/sys/module/virtio_snd/parameters/$parameter")
+        printf 'VIRTSND_MODULE_PARAM_%s=%s\n' "$parameter" "$actual_value"
+        if [ "$actual_value" != "$expected_value" ]; then
+            echo "VIRTSND_MODULE_PARAM_MISMATCH=$parameter expected=$expected_value actual=$actual_value"
+            exit 1
+        fi
+    done
+fi
+
+printf '\nVIRTIO_SND_GUEST_READY release=%s\n' "$release"
+cat /proc/asound/cards
+cat /proc/asound/pcm
+ls -l /dev/snd
+test -c /dev/snd/pcmC0D0p
+printf 'DIRECT_RESET_PCM_READY=/dev/snd/pcmC0D0p\n'
+stty -echo </dev/console 2>/dev/null || true
+PS1=''
+export PS1
+exec /bin/sh -i

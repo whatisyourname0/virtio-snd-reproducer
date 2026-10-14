@@ -1,0 +1,146 @@
+From 924721deb466e40f1a8cab05e4a1ab6543d1e971 Mon Sep 17 00:00:00 2001
+From: Draft patch author <draft-author@example.invalid>
+Date: Wed, 14 Oct 2026 09:22:39 +0900
+Subject: [RFC PATCH 0/1] ALSA: virtio: stage capture for VZ backends
+
+Base: d58a3ac9b1719fdf8ce9d286be606128aeebf1aa
+      ("ALSA: virtio: Keep control payloads alive through DMA completion")
+      Local tip of the five submitted v3 patches; not an upstream commit.
+Previous series: <cover.1791881787.git.mynameisjune111@gmail.com>
+Link: https://lore.kernel.org/all/cover.1791881787.git.mynameisjune111@gmail.com/
+
+This is a follow-up RFC, not a replacement or v4 of that five-patch series.
+The submitted v3 fixes ACK error propagation, failed START recovery, and
+message/buffer lifetime through completion and reset. It does not add the
+VZ capture profile or the ALSA core drain handling in these companion RFCs.
+
+On the tested Apple Virtualization.framework capture path, short RX
+completions and the observed response layout exposed problems with the
+existing ring accounting. We also observed capture failing to resume queued
+RX after pause release. These observations motivate a compatibility path;
+they do not establish that every VZ version behaves this way or settle
+whether a backend response violates the virtio-sound specification.
+
+This RFC adds request-owned capture buffers. It validates returned length,
+status, frame alignment and ring capacity before copying audio into ALSA,
+and accounts copied, consumed and notified data separately. On the normal
+MMU path this replaces direct DMA into the ALSA ring when staging is enabled,
+at the cost of extra memory and copying. v3 already has a separate NOMMU
+bounce-buffer path; staging is not the first owned-buffer path in the driver.
+
+The pause profile uses STOP/RELEASE and re-preparation for subsequent START,
+while preserving audio already captured in the ALSA ring. It does not promise
+continuous capture during the paused interval. An ambiguous control outcome
+fails closed and may require device reprobe rather than an automatic retry.
+
+All five module parameters default off: capture_staging,
+capture_packed_status, capture_allow_short, capture_allow_empty and
+capture_pause_restart. These are explicit profile controls, not automatic
+VZ detection or newly negotiated virtio features. The companion generic wait
+and ALSA core changes still apply when this profile is disabled.
+
+Dependencies and scope
+
+Apply after v3 and these three proposed prerequisites:
+- ALSA: virtio: wait through signals for PCM teardown
+- ALSA: pcm: allow capture reads while draining
+- ALSA: pcm: refresh capture pointers before drain
+
+This combined PCM patch shares ownership, counters and lifecycle state
+across staging and pause/restart. Its size is a review concern. A smaller
+split needs independently buildable and validated intermediate states.
+The patch changes guest behavior; it does not add a microphone device to
+stock Docker Desktop or implement host audio routing in its other VMMs.
+
+Validation and limits
+
+The complete local candidate (v3 plus all four RFC patches) was freshly
+built on 2026-10-14 as an ARM64 KASAN Image and installed module set with
+W=1, release 7.3.0-rc6-snd-lifetime-kasan. No old kernel objects were reused.
+There were no build errors or warnings in the changed sound paths; 517
+-Woverride-init warnings remain in two unchanged ARM64 base files.
+This is a rebuild of the pinned candidate, not a rebase to a newer upstream
+or sound maintainer tree.
+
+All ten ordinary-TCG scenarios passed with the same fresh kernel/module
+set: three short-tail drain/drop cases, four delayed-control cases, one
+pending-RX case, and two direct STOP/RELEASE reset-cancellation cases.
+Ambiguous STOP/RELEASE/PREPARE/START timeouts leave the reader at XRUN with
+zero frames; prepare is rejected before reprobe, then capture recovers.
+
+In the pending-RX case, STOP and RELEASE are acknowledged; waiting for the
+held RX times out after 1017 ms. It completes once after 5.08 guest seconds,
+then capture returns 1024 frames without another RELEASE or reset. Running
+this case from the relocated final archive also passes (1016 ms / 4.99s).
+The direct cases cancel held STOP/RELEASE responses by device unbind/rebind
+after SIGKILL and timeout, wait beyond the old response deadline, then pass
+playback/capture/replay. This does not cover every reset interleaving or
+actual event-virtqueue XRUN delivery.
+
+The QEMU 11.1.2 fixture includes backend reset cleanup changes as well as
+fault injection. These are integrated candidate results, not standalone
+v3 or isolated-patch proof, and not stock-QEMU, VZ or hardware acceptance.
+Earlier runs failed follow-on capture with ring saturation and overruns;
+those logs remain retained. Final passes do not establish a permanent fix
+for load or clock/scheduling sensitivity.
+
+Historical microphone evidence (not rerun with this new KASAN build):
+Our LinuxKit VZ launcher passed AirPods Compose capture at 6s/600s/6s.
+The 600s run returned 28,800,000 frames in 600.088s with recorder status 0
+and no non-finite samples. After recorder SIGKILL, two captures passed;
+after VM stop and fresh boot, 6s/70s/6s passed. SIP stayed enabled, the host
+audio service was not restarted, and no microphone PCM was saved.
+That earlier Compose virtio_snd.ko SHA-256 was
+245db509cb64b596e608d9ed5d86fb30235033d08b4bfcc495026252087e4476.
+It is a different binary/configuration from the fresh KASAN runtime set.
+The historical guest was 7.3.0-rc6-linuxkit-vz-compose-r3-20261014, with two
+vCPUs and --mem 4096. The packaging host reported macOS 26.7 (25G229), but
+that build was not recorded in the original run log. The exact historical
+launcher binary is not pinned by its public PR link. See vz/README.txt in
+the bundle for known inputs and these reproduction limits.
+
+The historical floating-point peak was 1.73. Liveness and finite samples
+do not establish acoustic calibration or absence of clipping. Built-in
+input, input switching, macOS sleep/wake, guest freeze/restore, physical
+non-coherent DMA/NOMMU systems and other Docker Desktop VMMs have not been
+validated on this candidate. This remains an experimental RFC.
+
+Reproducer
+
+A source-only bundle contains the pinned base/v3/RFC preparation recipe,
+kernel builder, QEMU patch stack, guest probes and all ten runtime commands.
+See qemu/README.txt and qemu/VALIDATION-RESULTS.txt in that bundle. The final
+runtime set passed under ordinary TCG; no KASAN/BUG/WARNING/oops/panic was
+matched. The 24 Python harness tests and relocated source comparison also
+passed. Existing v3 patches are included only as build prerequisites, not
+for resubmission. Publication or delivery of the bundle is still pending;
+this local draft does not claim an available public download.
+
+Questions for review
+
+- Which observed response and pause behaviors should be fixed in the host
+  backend instead of accepted by a guest compatibility path? What protocol
+  traces or conformance cases would help decide this?
+- Are module parameters appropriate for this profile, or should activation
+  use an identifiable device quirk or a negotiated capability? What stable
+  identification would be acceptable rather than a blanket VZ assumption?
+- Is release/reprepare an acceptable implementation of capture pause, with
+  buffered-tail preservation but no continuity during the pause interval?
+- Is request-owned staging acceptable for this scope, and how should the
+  patch be split so ownership and lifecycle invariants remain reviewable?
+- Which PM, non-VZ backend and capture-format regressions should gate a
+  non-RFC submission?
+
+Local review draft: the author name/address are placeholders. Human author
+confirmation and DCO certification are still required before sending.
+No human Signed-off-by has been added. Assisted-by: LLM.
+
+Draft patch author (1):
+  ALSA: virtio: stage VZ capture and restart paused streams
+
+ sound/virtio/virtio_pcm.c     |  93 ++++-
+ sound/virtio/virtio_pcm.h     |  68 ++++
+ sound/virtio/virtio_pcm_msg.c | 286 ++++++++++++-
+ sound/virtio/virtio_pcm_ops.c | 734 +++++++++++++++++++++++++++++++++-
+ 4 files changed, 1151 insertions(+), 30 deletions(-)
+

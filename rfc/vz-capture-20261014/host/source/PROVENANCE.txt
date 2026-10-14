@@ -1,0 +1,11 @@
+Bundled baseline source
+
+Origin: Linux sound/virtio/virtio_ctl_msg.c at submitted v3 tip
+d58a3ac9b1719fdf8ce9d286be606128aeebf1aa
+The file is byte-identical to git show <tip>:sound/virtio/virtio_ctl_msg.c.
+SHA-256: b1462cb3b72413c95b2887b55c294cab5559031a7b1c21b1a590124fe8fe515b
+
+The v3 patches needed to construct that source are in ../../prerequisites/.
+This source is the pre-RFC wait baseline, not an unpatched mainline source.
+It already contains the generic v3 lifetime fixes. Original GPL/copyright
+notices are retained. It is included for the explicit wait comparison.

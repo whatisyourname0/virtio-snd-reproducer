@@ -1,0 +1,51 @@
+Local validation: 2026-10-14 KST
+
+Source preparation and fresh build
+- Candidate: original base + five submitted v3 prerequisite patches + four
+  RFC patches. All eight changed files match the reviewed worktree exactly.
+- Built the current complete candidate source from scratch: ARM64 KASAN,
+  W=1 Image/modules, modules_install and depmod. No historical objects reused.
+- Release: 7.3.0-rc6-snd-lifetime-kasan. Build: no errors or sound-path warnings;
+  517 override-init warnings remain in two unchanged ARM64 base files.
+- Original source, index, branch and four RFC implementation patches preserved.
+
+Synthetic QEMU runtime
+- Ten scenarios passed under ordinary TCG using the fresh kernel/modules:
+  short drain after0/after1/drop; delayed PREPARE/START/STOP/RELEASE responses;
+  pending RX after acknowledged STOP/RELEASE; direct STOP/RELEASE cancellation
+  by SIGKILL followed by device unbind/rebind and playback/capture/replay.
+- Checks include exact frame counts/hashes, bounded timeout, XRUN with no
+  delivered frames, rejection before reprobe, late response ownership, reset
+  cancellation beyond the timer deadline, next capture and teardown.
+- Final runs matched no KASAN/BUG/WARNING/oops/panic diagnostic.
+- Earlier failed runs are retained, including follow-on capture overruns.
+  Passing final runs do not prove load/scheduling sensitivity permanently fixed.
+- The fixture includes synthetic backend reset cleanup fixes; these results
+  do not establish stock-QEMU reset correctness.
+- See qemu/VALIDATION-RESULTS.txt for hashes, build provenance and limitations.
+
+Host source-extracted checks
+- Prior unchanged-source evidence: PCM 99, control 44, remove 129, stopped 73,
+  DMA 80, payload 465, ACK 38 assertions, plus NOMMU lifetime checks.
+- Control-wait candidate: 108 assertions; submitted v3 baseline: 14 expected
+  wait-selection failures, no sanitizer diagnostics. The comparison is
+  repeated from the relocated final archive and logged outside this bundle.
+- These harnesses model kernel primitives; they do not prove real scheduler
+  interleavings, DMA operation or physical microphone behavior.
+
+Static and portability checks
+- Lifecycle harness: 19 pytest tests; direct-reset harness: five pytest tests.
+- Ruff lint/format, ty and shell syntax passed. Guest probes build with
+  -Wall -Wextra -Werror. Four RFC patches pass strict checkpatch with
+  --no-signoff --no-tree; this intentionally does not certify human DCO.
+- Runnable source and instructions use explicit paths, with no private
+  absolute workspace paths. Archive includes sources/patches/docs only.
+- No kernel binaries, modules, rootfs, recordings or credentials are bundled.
+
+Scope
+- Current local RFC candidate was rebuilt; this is not a rebase onto a newer
+  upstream tip and not proof of standalone submitted v3 behavior.
+- No new actual microphone, VZ/Compose, input-switch, sleep/wake or hardware
+  DMA/NOMMU test in this task. No broad production-readiness claim.
+- The four RFC patches still need human authorship/DCO certification.
+- No email, upload, push, PR, commit or new signoff was performed.
