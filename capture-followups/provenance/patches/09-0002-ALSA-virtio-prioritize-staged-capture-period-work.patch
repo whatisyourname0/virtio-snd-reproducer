@@ -1,0 +1,179 @@
+From 8d0d4c1a6c4bcb81ae9f52d1c0d979fafb2e22f2 Mon Sep 17 00:00:00 2001
+From: Joonho Lee <mynameisjune111@gmail.com>
+To: Anton Yakovlev <anton.yakovlev@opensynergy.com>,
+ "Michael S. Tsirkin" <mst@redhat.com>, Takashi Iwai <tiwai@suse.com>
+Cc: Jaroslav Kysela <perex@perex.cz>, linux-sound@vger.kernel.org,
+ virtualization@lists.linux.dev, linux-kernel@vger.kernel.org
+Date: Sat, 17 Oct 2026 14:46:07 +0900
+Subject: [RFC PATCH 2/2] ALSA: virtio: prioritize staged capture period work
+Message-ID: <rfc-virtio-snd-capture-followups-2.f2737c95c12e45b4@gmail.com>
+In-Reply-To: <rfc-virtio-snd-capture-followups-0.f2737c95c12e45b4@gmail.com>
+References: <rfc-virtio-snd-capture-followups-0.f2737c95c12e45b4@gmail.com>
+
+CPU contention can delay staged capture period notifications while RX
+completions continue filling the unread ring. In a two-vCPU VZ guest with
+16 nice-0 CPU workers, the ACK-fixed baseline stopped with ring_capacity
+and EPIPE in three runs, after 11.74, 30.77 and 30.33 seconds of audio.
+
+Route staged capture period work through system_highpri_wq with a common
+helper at all ten producers, including ACK errors and self-requeue. Keep
+playback and non-staged streams on the normal workqueue. Initialization,
+cancellation, buffer geometry and capture accounting remain unchanged.
+
+With the same kernel, input, geometry and userspace priority, the candidate
+completed three 70-second captures and immediate reopens. Its maximum
+matched queue-to-start delay was 20.366 ms, versus 108.112 ms in the first
+baseline failure. The other baseline failures had pending work without
+matching execution, so matched-only statistics do not bound that delay.
+
+Reader scheduling delays were also present. Both arms passed a separate
+nice -10 reader control, and host load varied between runs. These results
+support the change for the tested workload without isolating a kernel-only
+cause or guaranteeing lossless capture under arbitrary CPU load.
+KASAN/lockdep QEMU regressions passed with the unchanged candidate source.
+
+This follows the staged ACK fix and pending VZ capture support. The
+introducing staged-capture patch has no upstream Fixes commit ID yet.
+
+Link: https://lore.kernel.org/all/rfc-v2-vz-capture-compat-1.b9ab4c1540dc4691@gmail.com/
+Assisted-by: LLM
+Signed-off-by: Joonho Lee <mynameisjune111@gmail.com>
+---
+ sound/virtio/virtio_pcm.c     |  4 ++--
+ sound/virtio/virtio_pcm.h     | 12 ++++++++++++
+ sound/virtio/virtio_pcm_msg.c |  6 +++---
+ sound/virtio/virtio_pcm_ops.c | 10 +++++-----
+ 4 files changed, 22 insertions(+), 10 deletions(-)
+
+diff --git a/sound/virtio/virtio_pcm.c b/sound/virtio/virtio_pcm.c
+index a3478fc8848db..d8515b2144a14 100644
+--- a/sound/virtio/virtio_pcm.c
++++ b/sound/virtio/virtio_pcm.c
+@@ -397,7 +397,7 @@ static void virtsnd_pcm_period_elapsed(struct work_struct *work)
+ 	}
+ 
+ 	if (requeue)
+-		schedule_work(&vss->elapsed_period);
++		virtsnd_pcm_schedule_period_elapsed(vss);
+ }
+ 
+ /**
+@@ -606,7 +606,7 @@ void virtsnd_pcm_event(struct virtio_snd *snd, struct virtio_snd_event *event)
+ 			if (vss->xfer_enabled) {
+ 				vss->xfer_xrun = true;
+ 				if (vss->capture_staging)
+-					schedule_work(&vss->elapsed_period);
++					virtsnd_pcm_schedule_period_elapsed(vss);
+ 			}
+ 		}
+ 		break;
+diff --git a/sound/virtio/virtio_pcm.h b/sound/virtio/virtio_pcm.h
+index e143a15592f05..5d1d88f2823b2 100644
+--- a/sound/virtio/virtio_pcm.h
++++ b/sound/virtio/virtio_pcm.h
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/atomic.h>
+ #include <linux/virtio_config.h>
++#include <linux/workqueue.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm-indirect.h>
+ 
+@@ -114,6 +115,17 @@ struct virtio_pcm_substream {
+ 	wait_queue_head_t msg_empty;
+ };
+ 
++/* Keep non-staged PCM notifications on schedule_work()'s normal queue. */
++static inline bool
++virtsnd_pcm_schedule_period_elapsed(struct virtio_pcm_substream *vss)
++{
++	if (vss->direction == SNDRV_PCM_STREAM_CAPTURE &&
++	    vss->capture_staging)
++		return queue_work(system_highpri_wq, &vss->elapsed_period);
++
++	return schedule_work(&vss->elapsed_period);
++}
++
+ /*
+  * ALSA may observe a subperiod tail before its period callback. Keep actual
+  * unread occupancy separate from pointer observations and notification state.
+diff --git a/sound/virtio/virtio_pcm_msg.c b/sound/virtio/virtio_pcm_msg.c
+index 795e52e09564b..663f7695b5be8 100644
+--- a/sound/virtio/virtio_pcm_msg.c
++++ b/sound/virtio/virtio_pcm_msg.c
+@@ -627,7 +627,7 @@ static void virtsnd_pcm_capture_xrun_locked(struct virtio_pcm_substream *vss)
+ {
+ 	if (!vss->xfer_xrun) {
+ 		vss->xfer_xrun = true;
+-		schedule_work(&vss->elapsed_period);
++		virtsnd_pcm_schedule_period_elapsed(vss);
+ 	}
+ }
+ 
+@@ -720,7 +720,7 @@ static void virtsnd_pcm_capture_complete(struct virtio_pcm_msg *msg,
+ 			virtsnd_pcm_capture_xrun_locked(vss);
+ 		}
+ 		if (got_audio && !vss->xfer_xrun)
+-			schedule_work(&vss->elapsed_period);
++			virtsnd_pcm_schedule_period_elapsed(vss);
+ 	} else if (!vss->msg_count) {
+ 		wake_up_all(&vss->msg_empty);
+ 	}
+@@ -858,7 +858,7 @@ static void virtsnd_pcm_msg_complete(struct virtio_pcm_msg *msg,
+ 		runtime->delay =
+ 			bytes_to_frames(runtime,
+ 					le32_to_cpu(msg->status.latency_bytes));
+-		schedule_work(&vss->elapsed_period);
++		virtsnd_pcm_schedule_period_elapsed(vss);
+ 	} else if (!vss->msg_count) {
+ 		wake_up_all(&vss->msg_empty);
+ 	}
+diff --git a/sound/virtio/virtio_pcm_ops.c b/sound/virtio/virtio_pcm_ops.c
+index 85e7576903d56..d50924b792f65 100644
+--- a/sound/virtio/virtio_pcm_ops.c
++++ b/sound/virtio/virtio_pcm_ops.c
+@@ -232,7 +232,7 @@ virtsnd_pcm_pause_restart_fail(struct virtio_pcm_substream *vss,
+ 				VIRTSND_PCM_PAUSE_RESTART_RESET_REQUIRED;
+ 	}
+ 	if (notify_xrun)
+-		schedule_work(&vss->elapsed_period);
++		virtsnd_pcm_schedule_period_elapsed(vss);
+ 	vss->substream->runtime->stop_operating = true;
+ }
+ 
+@@ -1253,7 +1253,7 @@ static int virtsnd_pcm_capture_staged_ack(struct virtio_pcm_substream *vss,
+ 			return -EPIPE;
+ 		if (!virtsnd_pcm_capture_counters_valid(vss)) {
+ 			vss->xfer_xrun = true;
+-			schedule_work(&vss->elapsed_period);
++			virtsnd_pcm_schedule_period_elapsed(vss);
+ 			return -EPIPE;
+ 		}
+ 
+@@ -1264,7 +1264,7 @@ static int virtsnd_pcm_capture_staged_ack(struct virtio_pcm_substream *vss,
+ 		if (diff < 0 ||
+ 		    (snd_pcm_uframes_t)diff > runtime->buffer_size) {
+ 			vss->xfer_xrun = true;
+-			schedule_work(&vss->elapsed_period);
++			virtsnd_pcm_schedule_period_elapsed(vss);
+ 			return -EPIPE;
+ 		}
+ 
+@@ -1275,7 +1275,7 @@ static int virtsnd_pcm_capture_staged_ack(struct virtio_pcm_substream *vss,
+ 				       &next_acked_total) ||
+ 		    next_acked_total > vss->capture_copied_total) {
+ 			vss->xfer_xrun = true;
+-			schedule_work(&vss->elapsed_period);
++			virtsnd_pcm_schedule_period_elapsed(vss);
+ 			return -EPIPE;
+ 		}
+ 
+@@ -1292,7 +1292,7 @@ static int virtsnd_pcm_capture_staged_ack(struct virtio_pcm_substream *vss,
+ 			rc = virtsnd_pcm_capture_send(vss);
+ 			if (rc) {
+ 				vss->xfer_xrun = true;
+-				schedule_work(&vss->elapsed_period);
++				virtsnd_pcm_schedule_period_elapsed(vss);
+ 			}
+ 		}
+ 	}

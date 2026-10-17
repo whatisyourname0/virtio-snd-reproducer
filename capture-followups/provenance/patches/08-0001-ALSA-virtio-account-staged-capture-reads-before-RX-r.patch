@@ -1,0 +1,195 @@
+From ddde35102bf4588d9aa98a3fe5321509d19cb6bf Mon Sep 17 00:00:00 2001
+From: Joonho Lee <mynameisjune111@gmail.com>
+To: Anton Yakovlev <anton.yakovlev@opensynergy.com>,
+ "Michael S. Tsirkin" <mst@redhat.com>, Takashi Iwai <tiwai@suse.com>
+Cc: Jaroslav Kysela <perex@perex.cz>, linux-sound@vger.kernel.org,
+ virtualization@lists.linux.dev, linux-kernel@vger.kernel.org
+Date: Sat, 17 Oct 2026 14:46:07 +0900
+Subject: [RFC PATCH 1/2] ALSA: virtio: account staged capture reads before RX
+ refill
+Message-ID: <rfc-virtio-snd-capture-followups-1.f2737c95c12e45b4@gmail.com>
+In-Reply-To: <rfc-virtio-snd-capture-followups-0.f2737c95c12e45b4@gmail.com>
+References: <rfc-virtio-snd-capture-followups-0.f2737c95c12e45b4@gmail.com>
+
+The RX callback holds the queue lock across a batch of completions. A
+reader that has copied samples can wait for that lock in ACK before its
+consumed bytes are removed from capture_ready. A later completion in the
+same batch can then reject data using stale ring occupancy.
+
+Account the staged read under the substream lock before acquiring the RX
+queue lock. Release that lock before taking the queue and substream locks
+in their established order to refill requests.
+
+Once accounting is committed, latch refill errors as XRUN and return
+success from ACK. A negative return would make ALSA restore appl_ptr while
+the driver retained the consumed-byte accounting. Keep pre-commit errors,
+ring-capacity checks, and normal period-work scheduling unchanged.
+
+Source-extracted host and kernel fixtures reproduce the stale-capacity
+race and post-commit ALSA pointer rollback. The candidate preserves wrapped
+data and pointer accounting. KASAN/lockdep QEMU lifecycle checks passed.
+The fixtures substitute selected backend helpers and do not independently
+establish physical-device acceptance.
+
+This follows pending staged capture support, whose introducing patch has
+no upstream commit ID for a Fixes tag yet.
+
+Link: https://lore.kernel.org/all/rfc-v2-vz-capture-compat-1.b9ab4c1540dc4691@gmail.com/
+Assisted-by: LLM
+Signed-off-by: Joonho Lee <mynameisjune111@gmail.com>
+---
+ sound/virtio/virtio_pcm_ops.c | 128 ++++++++++++++++++++--------------
+ 1 file changed, 77 insertions(+), 51 deletions(-)
+
+diff --git a/sound/virtio/virtio_pcm_ops.c b/sound/virtio/virtio_pcm_ops.c
+index 003832d112551..85e7576903d56 100644
+--- a/sound/virtio/virtio_pcm_ops.c
++++ b/sound/virtio/virtio_pcm_ops.c
+@@ -1229,70 +1229,96 @@ static int virtsnd_pcm_pb_ack(struct snd_pcm_substream *substream)
+ 	return 0;
+ }
+ 
+-static int virtsnd_pcm_cp_ack(struct snd_pcm_substream *substream)
++static int virtsnd_pcm_capture_staged_ack(struct virtio_pcm_substream *vss,
++					  struct snd_pcm_runtime *runtime)
+ {
+-	struct virtio_pcm_substream *vss = snd_pcm_substream_chip(substream);
+ 	struct virtio_snd_queue *queue = virtsnd_pcm_queue(vss);
+-	struct snd_pcm_runtime *runtime = substream->runtime;
+-	struct virtsnd_pcm_transfer transfer = {};
+-	int rc;
++	int rc = 0;
++
++	/*
++	 * The RX callback holds the queue lock while draining completions.
++	 * Account ALSA's read under the substream lock alone so completions later
++	 * in that drain observe the newly released ring space.
++	 */
++	scoped_guard(spinlock_irqsave, &vss->lock) {
++		snd_pcm_uframes_t appl_ptr;
++		snd_pcm_sframes_t diff;
++		size_t bytes;
++		u64 next_acked_total;
++
++		if (!vss->runtime_active || !runtime || !runtime->control ||
++		    !runtime->dma_area)
++			return -EBADFD;
++		if (vss->xfer_xrun)
++			return -EPIPE;
++		if (!virtsnd_pcm_capture_counters_valid(vss)) {
++			vss->xfer_xrun = true;
++			schedule_work(&vss->elapsed_period);
++			return -EPIPE;
++		}
+ 
++		appl_ptr = runtime->control->appl_ptr;
++		diff = appl_ptr - vss->pcm_indirect.appl_ptr;
++		if (diff < -(snd_pcm_sframes_t)(runtime->boundary / 2))
++			diff += runtime->boundary;
++		if (diff < 0 ||
++		    (snd_pcm_uframes_t)diff > runtime->buffer_size) {
++			vss->xfer_xrun = true;
++			schedule_work(&vss->elapsed_period);
++			return -EPIPE;
++		}
++
++		/* ACK includes any subperiod tail already copied to the ring. */
++		bytes = frames_to_bytes(runtime, diff);
++		if (bytes > vss->capture_ready ||
++		    check_add_overflow(vss->capture_acked_total, (u64)bytes,
++				       &next_acked_total) ||
++		    next_acked_total > vss->capture_copied_total) {
++			vss->xfer_xrun = true;
++			schedule_work(&vss->elapsed_period);
++			return -EPIPE;
++		}
++
++		vss->capture_acked_total = next_acked_total;
++		vss->capture_ready -= bytes;
++		vss->pcm_indirect.appl_ptr = appl_ptr;
++	}
++
++	/* Preserve the queue -> substream lock order while refilling requests. */
+ 	scoped_guard(spinlock_irqsave, &queue->lock) {
+ 		guard(spinlock)(&vss->lock);
+-		if (vss->capture_staging) {
+-			snd_pcm_uframes_t appl_ptr;
+-			snd_pcm_sframes_t diff;
+-			size_t bytes;
+-			u64 next_acked_total;
+-
+-			if (!vss->runtime_active || !runtime || !runtime->control ||
+-			    !runtime->dma_area)
+-				return -EBADFD;
+-			if (vss->xfer_xrun)
+-				return -EPIPE;
+-			if (!virtsnd_pcm_capture_counters_valid(vss)) {
++		if (vss->runtime_active && vss->xfer_enabled &&
++		    !vss->xfer_xrun) {
++			rc = virtsnd_pcm_capture_send(vss);
++			if (rc) {
+ 				vss->xfer_xrun = true;
+ 				schedule_work(&vss->elapsed_period);
+-				return -EPIPE;
+ 			}
+-			appl_ptr = runtime->control->appl_ptr;
+-			diff = appl_ptr - vss->pcm_indirect.appl_ptr;
++		}
++	}
+ 
+-			if (diff < -(snd_pcm_sframes_t)(runtime->boundary / 2))
+-				diff += runtime->boundary;
+-			if (diff < 0 ||
+-			    (snd_pcm_uframes_t)diff > runtime->buffer_size) {
+-				vss->xfer_xrun = true;
+-				schedule_work(&vss->elapsed_period);
+-				return -EPIPE;
+-			}
++	if (rc)
++		dev_warn_ratelimited(&vss->snd->vdev->dev,
++				     "SID %u: failed to refill capture queue after ACK: %d\n",
++				     vss->sid, rc);
+ 
+-			/* ACK includes any subperiod tail already copied to the ring. */
+-			bytes = frames_to_bytes(runtime, diff);
+-			if (bytes > vss->capture_ready ||
+-			    check_add_overflow(vss->capture_acked_total, (u64)bytes,
+-					       &next_acked_total) ||
+-			    next_acked_total > vss->capture_copied_total) {
+-				vss->xfer_xrun = true;
+-				schedule_work(&vss->elapsed_period);
+-				return -EPIPE;
+-			}
++	/* The ACK is committed; a refill failure is reported by the next XRUN. */
++	return 0;
++}
+ 
+-			vss->capture_acked_total = next_acked_total;
+-			vss->capture_ready -= bytes;
+-			vss->pcm_indirect.appl_ptr = appl_ptr;
+-			if (vss->xfer_enabled) {
+-				rc = virtsnd_pcm_capture_send(vss);
+-				if (rc) {
+-					vss->xfer_xrun = true;
+-					schedule_work(&vss->elapsed_period);
+-				}
+-				return rc;
+-			}
++static int virtsnd_pcm_cp_ack(struct snd_pcm_substream *substream)
++{
++	struct virtio_pcm_substream *vss = snd_pcm_substream_chip(substream);
++	struct virtio_snd_queue *queue = virtsnd_pcm_queue(vss);
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct virtsnd_pcm_transfer transfer = {};
++	int rc;
+ 
+-			return 0;
+-		}
++	if (vss->capture_staging)
++		return virtsnd_pcm_capture_staged_ack(vss, runtime);
+ 
++	scoped_guard(spinlock_irqsave, &queue->lock) {
++		guard(spinlock)(&vss->lock);
+ 		transfer.indirect = vss->pcm_indirect;
+ 		if (vss->stopped) {
+ 			rc = -EPIPE;

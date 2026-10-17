@@ -1,0 +1,26 @@
+[
+  {
+    "message_id": "rfc-virtio-snd-capture-followups-0.f2737c95c12e45b4@gmail.com",
+    "url": "https://lore.kernel.org/all/rfc-virtio-snd-capture-followups-0.f2737c95c12e45b4@gmail.com/raw",
+    "checked_at": "2026-10-17T06:00:50.767489+00:00",
+    "http_status": 200,
+    "public_message_verified": false,
+    "reason": "challenge_or_non_mail_response"
+  },
+  {
+    "message_id": "rfc-virtio-snd-capture-followups-1.f2737c95c12e45b4@gmail.com",
+    "url": "https://lore.kernel.org/all/rfc-virtio-snd-capture-followups-1.f2737c95c12e45b4@gmail.com/raw",
+    "checked_at": "2026-10-17T06:00:50.767801+00:00",
+    "http_status": 200,
+    "public_message_verified": false,
+    "reason": "challenge_or_non_mail_response"
+  },
+  {
+    "message_id": "rfc-virtio-snd-capture-followups-2.f2737c95c12e45b4@gmail.com",
+    "url": "https://lore.kernel.org/all/rfc-virtio-snd-capture-followups-2.f2737c95c12e45b4@gmail.com/raw",
+    "checked_at": "2026-10-17T06:00:50.767884+00:00",
+    "http_status": 200,
+    "public_message_verified": false,
+    "reason": "challenge_or_non_mail_response"
+  }
+]

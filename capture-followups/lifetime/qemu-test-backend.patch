@@ -1,0 +1,269 @@
+--- a/include/hw/audio/virtio-snd.h
++++ b/include/hw/audio/virtio-snd.h
+@@ -17,6 +17,7 @@
+ #define QEMU_VIRTIO_SOUND_H
+ 
+ #include "hw/virtio/virtio.h"
++#include "qemu/timer.h"
+ #include "qemu/audio.h"
+ #include "standard-headers/linux/virtio_ids.h"
+ #include "standard-headers/linux/virtio_snd.h"
+@@ -221,6 +222,18 @@
+     QemuMutex cmdq_mutex;
+     QTAILQ_HEAD(, virtio_snd_ctrl_command) cmdq;
+     bool processing_cmdq;
++    /* Runtime-only fault injection used by the local buffer-lifetime lab. */
++    uint32_t test_hold_capture_ms;
++    uint32_t test_capture_held;
++    uint32_t test_capture_completed;
++    uint32_t test_hold_pcm_info_ms;
++    uint32_t test_control_held;
++    uint32_t test_control_completed;
++    QEMUTimer *test_capture_timer;
++    VirtIOSoundPCMBuffer *test_capture_buffer;
++    QEMUTimer *test_control_timer;
++    virtio_snd_ctrl_command *test_control_command;
++    bool test_control_completing;
+     /*
+      * Convenience queue to keep track of invalid tx/rx queue messages inside
+      * the tx/rx callbacks.
+--- a/hw/audio/virtio-snd.c
++++ b/hw/audio/virtio-snd.c
+@@ -36,6 +36,8 @@
+ static void virtio_snd_pcm_flush(VirtIOSoundPCMStream *stream);
+ static void virtio_snd_pcm_in_cb(void *data, int available);
+ static void virtio_snd_unrealize(DeviceState *dev);
++static void virtio_snd_test_capture_cb(void *opaque);
++static void virtio_snd_test_control_cb(void *opaque);
+ 
+ static uint32_t supported_formats = BIT(VIRTIO_SND_PCM_FMT_S8)
+                                   | BIT(VIRTIO_SND_PCM_FMT_U8)
+@@ -720,6 +722,14 @@
+         cmd->resp.code = cpu_to_le32(VIRTIO_SND_S_BAD_MSG);
+     }
+ 
++    if (s->test_control_completing && code == VIRTIO_SND_R_PCM_INFO &&
++        cmd->payload_size) {
++        const uint8_t canary = 0xa5;
++
++        iov_from_buf(cmd->elem->in_sg, cmd->elem->in_num,
++                     sizeof(virtio_snd_hdr), &canary, sizeof(canary));
++    }
++
+     iov_from_buf(cmd->elem->in_sg,
+                  cmd->elem->in_num,
+                  0,
+@@ -747,6 +757,24 @@
+         qatomic_set(&s->processing_cmdq, true);
+         while (!QTAILQ_EMPTY(&s->cmdq)) {
+             cmd = QTAILQ_FIRST(&s->cmdq);
++
++            if (s->test_hold_pcm_info_ms && !s->test_control_command) {
++                virtio_snd_hdr hdr;
++
++                if (iov_to_buf(cmd->elem->out_sg, cmd->elem->out_num,
++                               0, &hdr, sizeof(hdr)) == sizeof(hdr) &&
++                    le32_to_cpu(hdr.code) == VIRTIO_SND_R_PCM_INFO) {
++                    QTAILQ_REMOVE(&s->cmdq, cmd, next);
++                    s->test_control_command = cmd;
++                    s->test_control_held++;
++                    timer_mod(s->test_control_timer,
++                              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
++                              s->test_hold_pcm_info_ms);
++                    s->test_hold_pcm_info_ms = 0;
++                    error_report("virtio-snd lifetime test: held PCM_INFO control descriptor");
++                    break;
++                }
++            }
+ 
+             /* process command */
+             process_cmd(s, cmd);
+@@ -791,6 +819,25 @@
+     }
+ 
+     virtio_snd_process_cmdq(s);
++}
++
++/* Complete one held PCM_INFO response after the guest's control timeout. */
++static void virtio_snd_test_control_cb(void *opaque)
++{
++    VirtIOSound *s = VIRTIO_SND(opaque);
++    virtio_snd_ctrl_command *cmd = s->test_control_command;
++
++    if (!cmd) {
++        return;
++    }
++
++    s->test_control_completing = true;
++    QTAILQ_INSERT_HEAD(&s->cmdq, cmd, next);
++    virtio_snd_process_cmdq(s);
++    s->test_control_completing = false;
++    s->test_control_command = NULL;
++    s->test_control_completed++;
++    error_report("virtio-snd lifetime test: completed delayed PCM_INFO control descriptor");
+ }
+ 
+ /*
+@@ -1116,6 +1163,13 @@
+             goto error_cleanup;
+         }
+     }
++
++    vsnd->test_capture_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
++                                             virtio_snd_test_capture_cb,
++                                             vsnd);
++    vsnd->test_control_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
++                                             virtio_snd_test_control_cb,
++                                             vsnd);
+ 
+     return;
+ 
+@@ -1266,6 +1320,17 @@
+             if (!virtio_queue_ready(buffer->vq)) {
+                 return;
+             }
++            if (stream->s->test_hold_capture_ms &&
++                !stream->s->test_capture_buffer) {
++                stream->s->test_capture_buffer = buffer;
++                stream->s->test_capture_held++;
++                QSIMPLEQ_REMOVE_HEAD(&stream->queue, entry);
++                timer_mod(stream->s->test_capture_timer,
++                          qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
++                          stream->s->test_hold_capture_ms);
++                error_report("virtio-snd lifetime test: held capture descriptor");
++                break;
++            }
+             if (!stream->active) {
+                 /* Stream has stopped, so do not perform audio_be_read. */
+                 return_rx_buffer(stream, buffer);
+@@ -1312,6 +1377,45 @@
+     }
+ }
+ 
++/* Complete a single held capture descriptor after the guest timeout path. */
++static void virtio_snd_test_capture_cb(void *opaque)
++{
++    VirtIOSound *s = VIRTIO_SND(opaque);
++    VirtIOSoundPCMBuffer *buffer = s->test_capture_buffer;
++    virtio_snd_pcm_status status = { 0 };
++    g_autofree uint8_t *payload = NULL;
++    size_t capacity;
++
++    if (!buffer) {
++        return;
++    }
++
++    capacity = iov_size(buffer->elem->in_sg, buffer->elem->in_num);
++    if (capacity < sizeof(status)) {
++        status.status = cpu_to_le32(VIRTIO_SND_S_BAD_MSG);
++        iov_from_buf(buffer->elem->in_sg, buffer->elem->in_num, 0,
++                     &status, sizeof(status));
++        virtqueue_push(buffer->vq, buffer->elem, sizeof(status));
++    } else {
++        capacity -= sizeof(status);
++        payload = g_malloc(MAX(capacity, 1));
++        memset(payload, 0xa5, capacity);
++        iov_from_buf(buffer->elem->in_sg, buffer->elem->in_num, 0,
++                     payload, capacity);
++        status.status = cpu_to_le32(VIRTIO_SND_S_OK);
++        iov_from_buf(buffer->elem->in_sg, buffer->elem->in_num, capacity,
++                     &status, sizeof(status));
++        virtqueue_push(buffer->vq, buffer->elem,
++                       capacity + sizeof(status));
++    }
++    virtio_notify(VIRTIO_DEVICE(s), buffer->vq);
++    virtio_snd_pcm_buffer_free(buffer);
++    s->test_capture_buffer = NULL;
++    s->test_hold_capture_ms = 0;
++    s->test_capture_completed++;
++    error_report("virtio-snd lifetime test: completed delayed capture descriptor");
++}
++
+ /*
+  * Flush all buffer data from this output stream's queue into the driver's
+  * virtual queue.
+@@ -1340,6 +1444,22 @@
+     VirtIOSoundPCMStream *stream;
+ 
+     qemu_del_vm_change_state_handler(vsnd->vmstate);
++    if (vsnd->test_capture_timer) {
++        timer_free(vsnd->test_capture_timer);
++        vsnd->test_capture_timer = NULL;
++    }
++    if (vsnd->test_capture_buffer) {
++        virtio_snd_pcm_buffer_free(vsnd->test_capture_buffer);
++        vsnd->test_capture_buffer = NULL;
++    }
++    if (vsnd->test_control_timer) {
++        timer_free(vsnd->test_control_timer);
++        vsnd->test_control_timer = NULL;
++    }
++    if (vsnd->test_control_command) {
++        virtio_snd_ctrl_cmd_free(vsnd->test_control_command);
++        vsnd->test_control_command = NULL;
++    }
+     trace_virtio_snd_unrealize(vsnd);
+ 
+     if (vsnd->pcm.streams) {
+@@ -1369,6 +1489,24 @@
+     VirtIOSound *vsnd = VIRTIO_SND(vdev);
+     virtio_snd_ctrl_command *cmd;
+ 
++    if (vsnd->test_capture_timer) {
++        timer_del(vsnd->test_capture_timer);
++    }
++    if (vsnd->test_capture_buffer) {
++        virtio_snd_pcm_buffer_free(vsnd->test_capture_buffer);
++        vsnd->test_capture_buffer = NULL;
++    }
++    vsnd->test_hold_capture_ms = 0;
++    if (vsnd->test_control_timer) {
++        timer_del(vsnd->test_control_timer);
++    }
++    if (vsnd->test_control_command) {
++        virtio_snd_ctrl_cmd_free(vsnd->test_control_command);
++        vsnd->test_control_command = NULL;
++    }
++    vsnd->test_hold_pcm_info_ms = 0;
++    vsnd->test_control_completing = false;
++
+     /*
+      * Sanity check that the invalid buffer message queue is emptied at the end
+      * of every virtio_snd_handle_tx_xfer/virtio_snd_handle_rx_xfer call, and
+@@ -1404,11 +1542,36 @@
+     vdc->legacy_features = 0;
+ }
+ 
++static void virtio_snd_instance_init(Object *obj)
++{
++    VirtIOSound *s = VIRTIO_SND(obj);
++
++    object_property_add_uint32_ptr(obj, "x-test-hold-capture-ms",
++                                   &s->test_hold_capture_ms,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_add_uint32_ptr(obj, "x-test-capture-held",
++                                   &s->test_capture_held,
++                                   OBJ_PROP_FLAG_READ);
++    object_property_add_uint32_ptr(obj, "x-test-capture-completed",
++                                   &s->test_capture_completed,
++                                   OBJ_PROP_FLAG_READ);
++    object_property_add_uint32_ptr(obj, "x-test-hold-pcm-info-ms",
++                                   &s->test_hold_pcm_info_ms,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_add_uint32_ptr(obj, "x-test-control-held",
++                                   &s->test_control_held,
++                                   OBJ_PROP_FLAG_READ);
++    object_property_add_uint32_ptr(obj, "x-test-control-completed",
++                                   &s->test_control_completed,
++                                   OBJ_PROP_FLAG_READ);
++}
++
+ static const TypeInfo virtio_snd_types[] = {
+     {
+       .name          = TYPE_VIRTIO_SND,
+       .parent        = TYPE_VIRTIO_DEVICE,
+       .instance_size = sizeof(VirtIOSound),
++      .instance_init = virtio_snd_instance_init,
+       .class_init    = virtio_snd_class_init,
+     }
+ };

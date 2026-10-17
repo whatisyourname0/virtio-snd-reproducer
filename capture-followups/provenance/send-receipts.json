@@ -1,0 +1,65 @@
+[
+  {
+    "file": "outgoing/0000-cover-letter.patch",
+    "message_id": "rfc-virtio-snd-capture-followups-0.f2737c95c12e45b4@gmail.com",
+    "sha256": "7877490acb6e7feb731855207b8fa070045232525be676e1b728b6a7777d2924",
+    "body_sha256": "d2c300a3cf0b2a9db453196ece4175bae4a742caef13f801f0ea36083a3bb15c",
+    "subject": "[RFC PATCH 0/2] ALSA: virtio: fix staged capture ACK ordering and period scheduling",
+    "recipients": [
+      "anton.yakovlev@opensynergy.com",
+      "linux-kernel@vger.kernel.org",
+      "linux-sound@vger.kernel.org",
+      "mst@redhat.com",
+      "perex@perex.cz",
+      "tiwai@suse.com",
+      "virtualization@lists.linux.dev"
+    ],
+    "state": "smtp_250_accepted",
+    "started_at": "2026-10-17T06:00:19.334389+00:00",
+    "exit_code": 0,
+    "finished_at": "2026-10-17T06:00:24.058974+00:00",
+    "actual_headers_and_recipients_verified": true
+  },
+  {
+    "file": "outgoing/0001-ALSA-virtio-account-staged-capture-reads-before-RX-r.patch",
+    "message_id": "rfc-virtio-snd-capture-followups-1.f2737c95c12e45b4@gmail.com",
+    "sha256": "c266608235e7ac061c583cf53a768f3f6f1e7d174d1cd28b8f2633831e98e4cf",
+    "body_sha256": "07a92e2f773dfa7e63fc429d41ee24d9221fa3831f585f31d913da4cd0aba507",
+    "subject": "[RFC PATCH 1/2] ALSA: virtio: account staged capture reads before RX refill",
+    "recipients": [
+      "anton.yakovlev@opensynergy.com",
+      "linux-kernel@vger.kernel.org",
+      "linux-sound@vger.kernel.org",
+      "mst@redhat.com",
+      "perex@perex.cz",
+      "tiwai@suse.com",
+      "virtualization@lists.linux.dev"
+    ],
+    "state": "smtp_250_accepted",
+    "started_at": "2026-10-17T06:00:24.059303+00:00",
+    "exit_code": 0,
+    "finished_at": "2026-10-17T06:00:30.203978+00:00",
+    "actual_headers_and_recipients_verified": true
+  },
+  {
+    "file": "outgoing/0002-ALSA-virtio-prioritize-staged-capture-period-work.patch",
+    "message_id": "rfc-virtio-snd-capture-followups-2.f2737c95c12e45b4@gmail.com",
+    "sha256": "0b172808ec659348ebed86a8699a7e63f21f03a3918cd874db4f21edae7625f8",
+    "body_sha256": "b938f1d660104bd22c7b81236c4a6aa79f427ab01fd9759df02661e82e23145d",
+    "subject": "[RFC PATCH 2/2] ALSA: virtio: prioritize staged capture period work",
+    "recipients": [
+      "anton.yakovlev@opensynergy.com",
+      "linux-kernel@vger.kernel.org",
+      "linux-sound@vger.kernel.org",
+      "mst@redhat.com",
+      "perex@perex.cz",
+      "tiwai@suse.com",
+      "virtualization@lists.linux.dev"
+    ],
+    "state": "smtp_250_accepted",
+    "started_at": "2026-10-17T06:00:30.204696+00:00",
+    "exit_code": 0,
+    "finished_at": "2026-10-17T06:00:35.803822+00:00",
+    "actual_headers_and_recipients_verified": true
+  }
+]

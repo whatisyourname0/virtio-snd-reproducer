@@ -1,0 +1,520 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Source-extracted ACK race fixture; not a virtio device/backend emulator. */
+/*
+ * Generated definitions are extracted from Linux source files:
+ * sound/virtio/virtio_pcm_ops.c, sound/virtio/virtio_pcm_msg.c and
+ * sound/virtio/virtio_pcm.h:
+ * Copyright (C) 2021 OpenSynergy GmbH
+ * sound/core/pcm_lib.c:
+ * Copyright (c) by Jaroslav Kysela <perex@perex.cz>
+ * Copyright (c) by Abramo Bagnara <abramo@alsa-project.org>
+ */
+#include <linux/atomic.h>
+#include <linux/completion.h>
+#include <linux/cpu.h>
+#include <linux/err.h>
+#include <linux/ktime.h>
+#include <linux/kthread.h>
+#include <linux/module.h>
+#include <linux/overflow.h>
+#include <linux/sched.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
+#include <linux/wait.h>
+#include <sound/pcm.h>
+#include <sound/pcm-indirect.h>
+#include <uapi/linux/virtio_snd.h>
+
+#define FIXTURE_BUFFER_BYTES 8192
+#define FIXTURE_INITIAL_READY 7168
+#define FIXTURE_AUDIO_BYTES 2048
+#define FIXTURE_ACK_FRAMES 320
+#define FIXTURE_ACK_BYTES (FIXTURE_ACK_FRAMES * 4)
+#define FIXTURE_READY_AFTER_ACK (FIXTURE_INITIAL_READY - FIXTURE_ACK_BYTES)
+#define FIXTURE_READY_AFTER_COMPLETION (FIXTURE_READY_AFTER_ACK + FIXTURE_AUDIO_BYTES)
+#define FIXTURE_COPIED_AFTER_COMPLETION (FIXTURE_INITIAL_READY + FIXTURE_AUDIO_BYTES)
+#define FIXTURE_LOCK_TIMEOUT_NS (5ULL * NSEC_PER_SEC)
+#define FIXTURE_HOST_WAIT (6 * HZ)
+
+struct virtio_snd_queue {
+	spinlock_t lock;
+};
+
+struct virtio_snd {
+	struct virtio_snd_queue queue;
+};
+
+struct virtio_pcm_substream {
+	struct virtio_snd *snd;
+	struct snd_pcm_substream *substream;
+	struct snd_pcm_indirect pcm_indirect;
+	spinlock_t lock;
+	size_t buffer_bytes;
+	size_t hw_ptr;
+	size_t capture_ready;
+	u64 capture_copied_total;
+	u64 capture_acked_total;
+	u64 capture_pointer_seen_total;
+	u64 capture_callback_snapshot;
+	bool capture_callback_snapshot_active;
+	bool runtime_active;
+	bool capture_staging;
+	bool capture_started;
+	unsigned int capture_empty;
+	bool xfer_enabled;
+	bool xfer_xrun;
+	bool stopped;
+	unsigned int nmsgs;
+	unsigned int msg_count;
+	wait_queue_head_t msg_empty;
+};
+
+struct virtio_pcm_msg {
+	struct virtio_pcm_substream *substream;
+	struct virtio_snd_pcm_status status;
+	size_t length;
+	u8 *data;
+};
+
+struct ack_fixture_case {
+	struct virtio_snd *snd;
+	struct virtio_pcm_substream *vss;
+	struct snd_pcm_substream *substream;
+	struct snd_pcm_runtime *runtime;
+	struct snd_pcm_mmap_control *control;
+	struct virtio_pcm_msg *msg;
+	u8 *ring;
+	u8 *payload;
+	atomic_t queue_attempted;
+	atomic_t queue_held;
+	atomic_t queue_worker_timeout;
+	atomic_t ack_result;
+	atomic_t send_calls;
+	atomic_t send_failure;
+	atomic_t scheduled_work_calls;
+	atomic_t xrun_calls;
+	struct completion queue_held_done;
+	struct completion ack_start_done;
+	struct completion queue_done;
+	struct completion ack_done;
+	struct task_struct *queue_task;
+	struct task_struct *ack_task;
+	int queue_cpu;
+	int ack_cpu;
+};
+
+static struct ack_fixture_case *active_case;
+static bool fixture_packed_status;
+static bool fixture_allow_empty;
+static bool fixture_allow_short;
+
+static void fixture_note_queue_lock_attempt(void);
+static void fixture_schedule_work(struct virtio_pcm_substream *vss);
+static int fixture_capture_send(struct virtio_pcm_substream *vss);
+static void fixture_pcm_xrun(struct snd_pcm_substream *substream);
+int fixture_pcm_lib_apply_appl_ptr(struct snd_pcm_substream *substream,
+				   snd_pcm_uframes_t appl_ptr);
+
+#undef dev_warn_ratelimited
+#undef dev_err
+#define dev_warn_ratelimited(...) do { } while (0)
+#define dev_err(...) do { } while (0)
+#define trace_applptr(...) do { } while (0)
+
+static inline struct virtio_snd_queue *
+fixture_pcm_queue(struct virtio_pcm_substream *vss)
+{
+	return &vss->snd->queue;
+}
+
+static void fixture_pcm_trans_copy(struct snd_pcm_substream *substream,
+				   struct snd_pcm_indirect *indirect,
+				   size_t bytes)
+{
+	(void)substream;
+	(void)indirect;
+	(void)bytes;
+}
+
+static void fixture_pcm_transfer_failed(struct virtio_pcm_substream *vss)
+{
+	vss->xfer_enabled = false;
+	vss->stopped = true;
+}
+
+/* The non-staged playback/fallback helpers are outside this fixture's path. */
+static int fixture_pcm_msg_send(struct virtio_pcm_substream *vss,
+				unsigned long offset, unsigned long bytes)
+{
+	(void)vss;
+	(void)offset;
+	(void)bytes;
+	return -EOPNOTSUPP;
+}
+
+static void fixture_note_queue_lock_attempt(void)
+{
+	if (active_case)
+		atomic_set(&active_case->queue_attempted, 1);
+}
+
+static void fixture_schedule_work(struct virtio_pcm_substream *vss)
+{
+	(void)vss;
+	if (active_case)
+		atomic_inc(&active_case->scheduled_work_calls);
+}
+
+static int fixture_capture_send(struct virtio_pcm_substream *vss)
+{
+	(void)vss;
+	if (!active_case)
+		return -EINVAL;
+	atomic_inc(&active_case->send_calls);
+	return atomic_read(&active_case->send_failure);
+}
+
+static void fixture_pcm_xrun(struct snd_pcm_substream *substream)
+{
+	(void)substream;
+	if (active_case)
+		atomic_inc(&active_case->xrun_calls);
+}
+
+/* The generated bodies below retain the production ACK and completion code. */
+/* EXTRACTED_KERNEL_FUNCTIONS */
+
+static const struct snd_pcm_ops fixture_baseline_ops = {
+	.ack = fixture_baseline_cp_ack,
+};
+
+static const struct snd_pcm_ops fixture_candidate_ops = {
+	.ack = fixture_candidate_cp_ack,
+};
+
+static bool fixture_wait_flag(atomic_t *flag, u64 deadline)
+{
+	while (!atomic_read(flag)) {
+		if (ktime_get_ns() >= deadline || kthread_should_stop())
+			return false;
+		cpu_relax();
+	}
+	return true;
+}
+
+static int fixture_queue_worker(void *data)
+{
+	struct ack_fixture_case *test = data;
+	unsigned long flags;
+	u64 deadline;
+
+	spin_lock_irqsave(&test->snd->queue.lock, flags);
+	atomic_set(&test->queue_held, 1);
+	complete(&test->queue_held_done);
+	complete(&test->ack_start_done);
+	deadline = ktime_get_ns() + FIXTURE_LOCK_TIMEOUT_NS;
+	if (!fixture_wait_flag(&test->queue_attempted, deadline)) {
+		atomic_set(&test->queue_worker_timeout, 1);
+	} else {
+		fixture_capture_complete(test->msg,
+					 sizeof(test->msg->status) +
+					 FIXTURE_AUDIO_BYTES);
+	}
+	spin_unlock_irqrestore(&test->snd->queue.lock, flags);
+	complete(&test->queue_done);
+	while (!kthread_should_stop())
+		schedule_timeout_interruptible(HZ);
+	return 0;
+}
+
+static int fixture_ack_worker(void *data)
+{
+	struct ack_fixture_case *test = data;
+	int rc;
+
+	if (!wait_for_completion_timeout(&test->ack_start_done,
+					 FIXTURE_HOST_WAIT))
+		rc = -ETIMEDOUT;
+	else
+		rc = fixture_pcm_lib_apply_appl_ptr(test->substream,
+						    FIXTURE_ACK_FRAMES);
+	atomic_set(&test->ack_result, rc);
+	complete(&test->ack_done);
+	while (!kthread_should_stop())
+		schedule_timeout_interruptible(HZ);
+	return 0;
+}
+
+static int fixture_alloc_case(struct ack_fixture_case *test,
+			      const struct snd_pcm_ops *ops)
+{
+	test->snd = kzalloc(sizeof(*test->snd), GFP_KERNEL);
+	test->vss = kzalloc(sizeof(*test->vss), GFP_KERNEL);
+	test->substream = kzalloc(sizeof(*test->substream), GFP_KERNEL);
+	test->runtime = kzalloc(sizeof(*test->runtime), GFP_KERNEL);
+	test->control = kzalloc(sizeof(*test->control), GFP_KERNEL);
+	test->msg = kzalloc(sizeof(*test->msg), GFP_KERNEL);
+	test->ring = kzalloc(FIXTURE_BUFFER_BYTES, GFP_KERNEL);
+	test->payload = kzalloc(FIXTURE_AUDIO_BYTES, GFP_KERNEL);
+	if (!test->snd || !test->vss || !test->substream || !test->runtime ||
+	    !test->control || !test->msg || !test->ring || !test->payload)
+		return -ENOMEM;
+
+	spin_lock_init(&test->snd->queue.lock);
+	spin_lock_init(&test->vss->lock);
+	init_waitqueue_head(&test->vss->msg_empty);
+	init_completion(&test->queue_held_done);
+	init_completion(&test->ack_start_done);
+	init_completion(&test->queue_done);
+	init_completion(&test->ack_done);
+	atomic_set(&test->queue_attempted, 0);
+	atomic_set(&test->queue_held, 0);
+	atomic_set(&test->queue_worker_timeout, 0);
+	atomic_set(&test->ack_result, 0);
+	atomic_set(&test->send_calls, 0);
+	atomic_set(&test->send_failure, 0);
+	atomic_set(&test->scheduled_work_calls, 0);
+	atomic_set(&test->xrun_calls, 0);
+
+	test->substream->runtime = test->runtime;
+	test->substream->ops = ops;
+	test->substream->private_data = test->vss;
+	test->substream->stream = SNDRV_PCM_STREAM_CAPTURE;
+	test->runtime->control = test->control;
+	test->runtime->dma_area = test->ring;
+	test->runtime->dma_bytes = FIXTURE_BUFFER_BYTES;
+	test->runtime->frame_bits = 32;
+	test->runtime->buffer_size = FIXTURE_BUFFER_BYTES / 4;
+	test->runtime->boundary = test->runtime->buffer_size * 4;
+	test->runtime->info = 0;
+	test->control->appl_ptr = 0;
+
+	test->vss->snd = test->snd;
+	test->vss->substream = test->substream;
+	test->vss->buffer_bytes = FIXTURE_BUFFER_BYTES;
+	test->vss->hw_ptr = FIXTURE_INITIAL_READY;
+	test->vss->capture_ready = FIXTURE_INITIAL_READY;
+	test->vss->capture_copied_total = FIXTURE_INITIAL_READY;
+	test->vss->runtime_active = true;
+	test->vss->capture_staging = true;
+	test->vss->xfer_enabled = true;
+	test->vss->nmsgs = 1;
+	test->vss->msg_count = 1;
+	test->msg->substream = test->vss;
+	test->msg->length = FIXTURE_AUDIO_BYTES;
+	test->msg->data = test->payload;
+	test->msg->status.status = cpu_to_le32(VIRTIO_SND_S_OK);
+	test->msg->status.latency_bytes = 0;
+	memset(test->payload, 0xa5, FIXTURE_AUDIO_BYTES);
+	return 0;
+}
+
+static void fixture_free_case(struct ack_fixture_case *test)
+{
+	kfree(test->payload);
+	kfree(test->ring);
+	kfree(test->msg);
+	kfree(test->control);
+	kfree(test->runtime);
+	kfree(test->substream);
+	kfree(test->vss);
+	kfree(test->snd);
+}
+
+static int fixture_choose_cpus(int *queue_cpu, int *ack_cpu)
+{
+	int first;
+	int second;
+
+	if (num_online_cpus() < 2)
+		return -ENODEV;
+	first = cpumask_first(cpu_online_mask);
+	second = cpumask_next(first, cpu_online_mask);
+	if (second >= nr_cpu_ids)
+		return -ENODEV;
+	*queue_cpu = first;
+	*ack_cpu = second;
+	return 0;
+}
+
+static int fixture_start_thread(struct task_struct **task,
+				int (*threadfn)(void *), void *data,
+				int cpu, const char *name)
+{
+	*task = kthread_create(threadfn, data, "%s", name);
+	if (IS_ERR(*task))
+		return PTR_ERR(*task);
+	kthread_bind(*task, cpu);
+	wake_up_process(*task);
+	return 0;
+}
+
+static int fixture_run_race(const char *variant,
+			    const struct snd_pcm_ops *ops,
+			    bool candidate)
+{
+	struct ack_fixture_case test = {};
+	int rc;
+	int i;
+	bool copy_ok = true;
+
+	rc = fixture_alloc_case(&test, ops);
+	if (rc)
+		goto out;
+	rc = fixture_choose_cpus(&test.queue_cpu, &test.ack_cpu);
+	if (rc)
+		goto out;
+	active_case = &test;
+
+	/* Start the ACK waiter on the other CPU before the holder can spin. */
+	rc = fixture_start_thread(&test.ack_task, fixture_ack_worker, &test,
+				  test.ack_cpu, "ack-appl-ptr");
+	if (rc)
+		goto out;
+	rc = fixture_start_thread(&test.queue_task, fixture_queue_worker, &test,
+				  test.queue_cpu, "ack-queue-holder");
+	if (rc)
+		goto out;
+	if (!wait_for_completion_timeout(&test.queue_held_done, FIXTURE_HOST_WAIT)) {
+		rc = -ETIMEDOUT;
+		goto out;
+	}
+	if (!wait_for_completion_timeout(&test.ack_done, FIXTURE_HOST_WAIT) ||
+	    !wait_for_completion_timeout(&test.queue_done, FIXTURE_HOST_WAIT)) {
+		rc = -ETIMEDOUT;
+		goto out;
+	}
+	if (atomic_read(&test.queue_worker_timeout)) {
+		rc = -ETIMEDOUT;
+		goto out;
+	}
+	rc = atomic_read(&test.ack_result);
+	if (candidate) {
+		if (rc || test.control->appl_ptr != FIXTURE_ACK_FRAMES ||
+		    test.vss->capture_acked_total != FIXTURE_ACK_BYTES ||
+		    test.vss->capture_ready != FIXTURE_READY_AFTER_COMPLETION ||
+		    test.vss->capture_copied_total !=
+				FIXTURE_COPIED_AFTER_COMPLETION ||
+		    test.vss->hw_ptr !=
+				FIXTURE_COPIED_AFTER_COMPLETION % FIXTURE_BUFFER_BYTES ||
+		    test.vss->xfer_xrun ||
+		    atomic_read(&test.send_calls) != 2)
+			rc = -EINVAL;
+		for (i = 0; i < FIXTURE_BUFFER_BYTES; i++) {
+			bool copied = i >= FIXTURE_INITIAL_READY ||
+				      i < FIXTURE_AUDIO_BYTES -
+					  (FIXTURE_BUFFER_BYTES -
+					   FIXTURE_INITIAL_READY);
+
+			if (test.ring[i] != (copied ? 0xa5 : 0)) {
+				copy_ok = false;
+				break;
+			}
+		}
+		if (!copy_ok)
+			rc = -EFAULT;
+	} else if (rc != -EPIPE || test.control->appl_ptr != 0 ||
+		   test.vss->capture_ready != FIXTURE_INITIAL_READY ||
+		   test.vss->capture_copied_total != FIXTURE_INITIAL_READY ||
+		   !test.vss->xfer_xrun || atomic_read(&test.send_calls)) {
+		rc = -EINVAL;
+	} else {
+		rc = 0;
+	}
+	if (!rc)
+		pr_info("ACK_FIXTURE_RACE_PASS variant=%s cpus=%d,%d ack=%ld ready=%zu sends=%d\n",
+			variant, test.queue_cpu, test.ack_cpu,
+			(long)test.control->appl_ptr, test.vss->capture_ready,
+			atomic_read(&test.send_calls));
+
+out:
+	if (test.queue_task && !IS_ERR(test.queue_task))
+		kthread_stop(test.queue_task);
+	if (test.ack_task && !IS_ERR(test.ack_task))
+		kthread_stop(test.ack_task);
+	active_case = NULL;
+	fixture_free_case(&test);
+	if (rc)
+		pr_err("ACK_FIXTURE_RACE_FAIL variant=%s rc=%d\n", variant, rc);
+	return rc;
+}
+
+static int fixture_run_refill_failure(const char *variant,
+				      const struct snd_pcm_ops *ops,
+				      bool candidate)
+{
+	struct ack_fixture_case test = {};
+	int rc;
+
+	rc = fixture_alloc_case(&test, ops);
+	if (rc)
+		goto out;
+	active_case = &test;
+	atomic_set(&test.send_failure, -ENOMEM);
+	rc = fixture_pcm_lib_apply_appl_ptr(test.substream, FIXTURE_ACK_FRAMES);
+	if (test.vss->capture_acked_total != FIXTURE_ACK_BYTES ||
+	    test.vss->capture_ready != FIXTURE_READY_AFTER_ACK ||
+	    test.vss->pcm_indirect.appl_ptr != FIXTURE_ACK_FRAMES ||
+	    atomic_read(&test.send_calls) != 1 || !test.vss->xfer_xrun) {
+		rc = -EINVAL;
+	} else if (candidate) {
+		if (rc || test.control->appl_ptr != FIXTURE_ACK_FRAMES)
+			rc = -EINVAL;
+	} else if (rc != -ENOMEM || test.control->appl_ptr != 0) {
+		rc = -EINVAL;
+	} else {
+		rc = 0;
+	}
+	if (!rc)
+		pr_info("ACK_FIXTURE_REFILL_FAILURE_PASS variant=%s rc=%d appl_ptr=%ld acked=%llu ready=%zu\n",
+			variant, candidate ? 0 : -ENOMEM,
+			(long)test.control->appl_ptr,
+			(unsigned long long)test.vss->capture_acked_total,
+			test.vss->capture_ready);
+
+out:
+	active_case = NULL;
+	fixture_free_case(&test);
+	if (rc)
+		pr_err("ACK_FIXTURE_REFILL_FAILURE_FAIL variant=%s rc=%d\n",
+		       variant, rc);
+	return rc;
+}
+
+static int __init ack_fixture_init(void)
+{
+	int rc;
+	int failures = 0;
+
+	rc = fixture_run_race("baseline", &fixture_baseline_ops, false);
+	if (rc)
+		failures++;
+	rc = fixture_run_race("candidate", &fixture_candidate_ops, true);
+	if (rc)
+		failures++;
+	rc = fixture_run_refill_failure("baseline", &fixture_baseline_ops,
+					false);
+	if (rc)
+		failures++;
+	rc = fixture_run_refill_failure("candidate", &fixture_candidate_ops,
+					true);
+	if (rc)
+		failures++;
+	if (failures) {
+		pr_err("ACK_FIXTURE_FAIL failed_cases=%d; module remains loadable for deterministic result collection\n",
+		       failures);
+		return 0;
+	}
+	pr_info("ACK_FIXTURE_PASS source-extracted ACK + ALSA appl_ptr helper; fixture backend stubs only\n");
+	return 0;
+}
+
+static void __exit ack_fixture_exit(void)
+{
+}
+
+module_init(ack_fixture_init);
+module_exit(ack_fixture_exit);
+
+MODULE_DESCRIPTION("Source-extracted virtio-snd staged ACK race fixture");
+MODULE_LICENSE("GPL");

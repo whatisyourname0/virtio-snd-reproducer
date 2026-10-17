@@ -1,0 +1,49 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+set -eu
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+echo ACK_FIXTURE_GUEST_STARTED
+
+if ! /bin/busybox insmod /ack_fixture_module.ko; then
+	echo ACK_FIXTURE_GUEST_FAIL stage=insmod
+	/bin/busybox poweroff -f
+	exit 1
+fi
+
+if ! /bin/busybox rmmod ack_fixture_module; then
+	echo ACK_FIXTURE_GUEST_FAIL stage=rmmod
+	/bin/busybox poweroff -f
+	exit 1
+fi
+
+if ! /bin/busybox dmesg > /tmp/ack-fixture-dmesg.log 2>&1; then
+	cat /tmp/ack-fixture-dmesg.log
+	echo ACK_FIXTURE_GUEST_FAIL stage=dmesg
+	/bin/busybox poweroff -f
+	exit 1
+fi
+cat /tmp/ack-fixture-dmesg.log
+if /bin/busybox grep -E 'ACK_FIXTURE_(RACE|REFILL_FAILURE)_FAIL|ACK_FIXTURE_FAIL' \
+	/tmp/ack-fixture-dmesg.log; then
+	echo ACK_FIXTURE_GUEST_FAIL stage=fixture-assertion
+	/bin/busybox poweroff -f
+	exit 1
+fi
+if /bin/busybox grep -Ei \
+	'BUG:|kernel BUG at|KASAN:|WARNING:|Kernel panic|Oops:|Internal error: Oops -|possible circular locking dependency|inconsistent lock state|scheduling while atomic|possible recursive locking|DEBUG_LOCKS_WARN_ON|held lock' \
+	/tmp/ack-fixture-dmesg.log; then
+	echo ACK_FIXTURE_GUEST_FAIL stage=post-unload-diagnostics
+	/bin/busybox poweroff -f
+	exit 1
+fi
+if ! /bin/busybox grep -q 'ACK_FIXTURE_PASS ' /tmp/ack-fixture-dmesg.log; then
+	echo ACK_FIXTURE_GUEST_FAIL stage=module-pass-marker
+	/bin/busybox poweroff -f
+	exit 1
+fi
+
+echo 'ACK_FIXTURE_GUEST_PASS insmod=0 rmmod=0 dmesg=clean'
+/bin/busybox poweroff -f

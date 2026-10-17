@@ -1,0 +1,51 @@
+--- a/hw/audio/virtio-snd.c
++++ b/hw/audio/virtio-snd.c
+@@ -638,6 +638,7 @@
+                                    virtio_snd_pcm_set_params *params)
+ {
+     virtio_snd_pcm_set_params *st_params;
++    uint8_t sequence_max_channels = 2;
+ 
+     if (stream_id >= s->snd_conf.streams || s->pcm.pcm_params == NULL) {
+         virtio_error(VIRTIO_DEVICE(s), "Streams have not been initialized.\n");
+@@ -650,11 +651,16 @@
+         error_report("Number of channels is not supported.");
+         return cpu_to_le32(VIRTIO_SND_S_NOT_SUPP);
+     }
++    if (stream_id >= s->snd_conf.streams / 2 +
++                     (s->snd_conf.streams & 1)) {
++        sequence_max_channels = 8;
++    }
+     if (s->capture_test_mode == VIRTIO_SND_CAPTURE_TEST_SEQUENCE &&
+-        (params->channels > 2 || params->format != VIRTIO_SND_PCM_FMT_S16 ||
++        (params->channels > sequence_max_channels ||
++         params->format != VIRTIO_SND_PCM_FMT_S16 ||
+          params->rate != VIRTIO_SND_PCM_RATE_48000)) {
+-        error_report("virtio-snd sequence test requires S16_LE 48 kHz and "
+-                     "one or two channels");
++        error_report("virtio-snd sequence test requires S16_LE 48 kHz; "
++                     "capture supports up to 8 channels and playback up to 2");
+         return cpu_to_le32(VIRTIO_SND_S_NOT_SUPP);
+     }
+     if (params->format >= sizeof(supported_formats) * BITS_PER_BYTE ||
+@@ -844,7 +850,10 @@
+     stream->info.hdr.hda_fn_nid = VIRTIO_SOUND_HDA_FN_NID;
+     stream->info.features = 0;
+     stream->info.channels_min = 1;
+-    stream->info.channels_max = as.nchannels;
++    stream->info.channels_max =
++        s->capture_test_mode == VIRTIO_SND_CAPTURE_TEST_SEQUENCE &&
++                stream->info.direction == VIRTIO_SND_D_INPUT
++            ? 8 : as.nchannels;
+     stream->info.formats = supported_formats;
+     stream->info.rates = supported_rates;
+     stream->params = *params;
+@@ -2121,7 +2130,7 @@
+     size_t i;
+ 
+     if (stream->as.fmt != AUDIO_FORMAT_S16 || stream->as.big_endian ||
+-        stream->as.nchannels < 1 || stream->as.nchannels > 2 ||
++        stream->as.nchannels < 1 || stream->as.nchannels > 8 ||
+         !stream->capture_sequence_initialized ||
+         stream->capture_sequence_failed) {
+         stream->capture_sequence_failed = true;

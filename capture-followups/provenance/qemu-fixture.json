@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "version": "11.1.2",
+  "final_source_sha256": {
+    "hw/audio/virtio-snd.c": "738b95c123a74d3da5428584e8f1579fabe9658ecaf9a5a4d797a3dc449917f2",
+    "include/hw/audio/virtio-snd.h": "4dbd019fc38da5764f63157416cfdc3e5f2d967a0fdcf3e5a465cfa1bb0b4ab6"
+  },
+  "historical_kernel_sha256": "da214742fd6128305ea53ea1693dd7c5f9c6cc26cb53e76e7a2da86f28b5198f",
+  "historical_initrd_sha256": "e154c761602dd75d58fc2a9bd2f651eba6d972ccf05ff7c93bfd34ff76c28add",
+  "fixture_scope": {
+    "enabled_only_when": "QEMU_VIRTIO_SND_CAPTURE_TEST=sequence",
+    "capture_pcm": {
+      "channels_min": 1,
+      "channels_max": 8,
+      "format": "S16_LE",
+      "rate_hz": 48000
+    },
+    "playback_max_channels_in_sequence_mode": 2,
+    "other_modes": "retain their existing negotiated channel limit",
+    "channel_map_config": {
+      "chmaps": 0,
+      "reason": "QEMU documents channel-map support as unimplemented; interleaved sample indices remain directly testable."
+    },
+    "pacing_path": "none backend audio_be_read remains active; deterministic samples replace read bytes after the backend returns."
+  },
+  "warning": "The consolidated patch applies to official QEMU 11.1.2. Incremental patches are historical only. Fresh source build and runtime verification are recorded separately in FRESH-BUILD-VALIDATION.md.",
+  "historical_incremental_patch_chain": [
+    "public reproducer qemu/qemu-test-backend.patch (baseline match must be checked)",
+    "control-trace-faults test-only-faults.patch",
+    "QEMU-SEQUENCE-FIXTURE.patch",
+    "QEMU-CHANNELS-4-8-EXTENSION.patch"
+  ],
+  "clean_source_recipe": {
+    "url": "https://download.qemu.org/qemu-11.1.2.tar.xz",
+    "archive_sha256": "731b5681e4bb18be313231579b8efd0296c5b015fa36dc533874b639ba838016",
+    "patch": "qemu/patches/QEMU-SEQUENCE-CONSOLIDATED.patch",
+    "patch_sha256": "a5d870268040585383e6320652b7d234a55b1ec27e059f395a9ad075efbe5829",
+    "builder": "qemu/build-sequence-qemu.sh",
+    "verification": "PASS: archive SHA256, dry-run and actual scratch application, both patched files byte-identical to previously tested source",
+    "fresh_full_binary_build_in_this_preparation": true,
+    "fresh_binary_sha256": "8f75bd949e6c4746b85e067b98addf39b2555f17e37a4c24f839deaede7c7133",
+    "fresh_build_report": "FRESH-BUILD-VALIDATION.md"
+  }
+}

@@ -1,0 +1,420 @@
+--- a/hw/audio/virtio-snd.c
++++ b/hw/audio/virtio-snd.c
+@@ -34,6 +34,10 @@
+ #define VIRTIO_SOUND_HDA_FN_NID 0
+ #define VIRTIO_SND_CAPTURE_TEST_LIMIT 4096
+ #define VIRTIO_SND_CAPTURE_TEST_DELAY_MAX_MS 60000U
++#define VIRTIO_SND_SEQUENCE_DEFAULT_SEED UINT64_C(0x243f6a8885a308d3)
++#define VIRTIO_SND_SEQUENCE_EPOCH_MUL UINT64_C(0x9e3779b185ebca87)
++#define VIRTIO_SND_SEQUENCE_FRAME_MUL UINT64_C(0xd6e8feb86659fd93)
++#define VIRTIO_SND_SEQUENCE_CHANNEL_MUL UINT64_C(0xa0761d6478bd642f)
+ 
+ static const char *virtio_snd_capture_test_mode_name(
+     VirtIOSoundCaptureTestMode mode)
+@@ -59,6 +63,8 @@
+         return "misaligned";
+     case VIRTIO_SND_CAPTURE_TEST_BAD_STATUS:
+         return "bad-status";
++    case VIRTIO_SND_CAPTURE_TEST_SEQUENCE:
++        return "sequence";
+     case VIRTIO_SND_CAPTURE_TEST_NONE:
+     default:
+         return "disabled";
+@@ -83,12 +89,30 @@
+     return true;
+ }
+ 
++static bool virtio_snd_capture_test_parse_u64(const char *key,
++                                              const char *text,
++                                              uint64_t *value,
++                                              Error **errp)
++{
++    uint64_t parsed;
++    const char *end;
++
++    if (!*text || qemu_strtou64(text, &end, 0, &parsed) || *end) {
++        error_setg(errp, "Invalid %s value in QEMU_VIRTIO_SND_CAPTURE_TEST",
++                   key);
++        return false;
++    }
++    *value = parsed;
++    return true;
++}
++
+ static bool virtio_snd_capture_test_configure(VirtIOSound *vsnd,
+                                                Error **errp)
+ {
+     const char *config = g_getenv("QEMU_VIRTIO_SND_CAPTURE_TEST");
+     g_auto(GStrv) tokens = NULL;
+-    bool have_after = false, have_count = false, valid = true;
++    bool have_after = false, have_count = false, have_epoch = false;
++    bool have_frame = false, have_seed = false, valid = true;
+     size_t i;
+ 
+     if (!config || !*config) {
+@@ -122,13 +146,19 @@
+         vsnd->capture_test_mode = VIRTIO_SND_CAPTURE_TEST_MISALIGNED;
+     } else if (g_str_equal(tokens[0], "bad-status")) {
+         vsnd->capture_test_mode = VIRTIO_SND_CAPTURE_TEST_BAD_STATUS;
++    } else if (g_str_equal(tokens[0], "sequence")) {
++        vsnd->capture_test_mode = VIRTIO_SND_CAPTURE_TEST_SEQUENCE;
++        vsnd->capture_test_count = VIRTIO_SND_CAPTURE_TEST_LIMIT;
++        vsnd->capture_test_seed = VIRTIO_SND_SEQUENCE_DEFAULT_SEED;
+     } else {
+         error_setg(errp, "Unknown mode '%s' in QEMU_VIRTIO_SND_CAPTURE_TEST",
+                    tokens[0]);
+         return false;
+     }
+ 
+-    vsnd->capture_test_count = 1;
++    vsnd->capture_test_count = vsnd->capture_test_mode ==
++                               VIRTIO_SND_CAPTURE_TEST_SEQUENCE
++                                   ? VIRTIO_SND_CAPTURE_TEST_LIMIT : 1;
+     for (i = 1; tokens[i]; i++) {
+         char *equals = strchr(tokens[i], '=');
+         uint32_t parsed;
+@@ -163,6 +193,24 @@
+                            "QEMU_VIRTIO_SND_CAPTURE_TEST");
+                 valid = false;
+             }
++        } else if (g_str_equal(key, "epoch") && !have_epoch &&
++                   vsnd->capture_test_mode ==
++                       VIRTIO_SND_CAPTURE_TEST_SEQUENCE) {
++            have_epoch = true;
++            valid = virtio_snd_capture_test_parse_u64(
++                key, value, &vsnd->capture_test_initial_epoch, errp);
++        } else if (g_str_equal(key, "frame") && !have_frame &&
++                   vsnd->capture_test_mode ==
++                       VIRTIO_SND_CAPTURE_TEST_SEQUENCE) {
++            have_frame = true;
++            valid = virtio_snd_capture_test_parse_u64(
++                key, value, &vsnd->capture_test_initial_frame, errp);
++        } else if (g_str_equal(key, "seed") && !have_seed &&
++                   vsnd->capture_test_mode ==
++                       VIRTIO_SND_CAPTURE_TEST_SEQUENCE) {
++            have_seed = true;
++            valid = virtio_snd_capture_test_parse_u64(
++                key, value, &vsnd->capture_test_seed, errp);
+         } else {
+             error_setg(errp,
+                        "Unknown or duplicate key '%s' in "
+@@ -176,11 +224,23 @@
+     }
+ 
+     if (valid) {
++        if (vsnd->capture_test_mode == VIRTIO_SND_CAPTURE_TEST_SEQUENCE &&
++            vsnd->capture_test_after) {
++            error_setg(errp, "sequence mode does not support after=N in "
++                       "QEMU_VIRTIO_SND_CAPTURE_TEST");
++            valid = false;
++        }
++    }
++    if (valid) {
+         vsnd->capture_test_remaining = vsnd->capture_test_count;
+         info_report("virtio-snd capture-test enabled: mode=%s after=%" PRIu32
+-                    " count=%" PRIu32,
++                    " count=%" PRIu32 " epoch=%" PRIu64
++                    " frame=%" PRIu64 " seed=0x%016" PRIx64,
+                     virtio_snd_capture_test_mode_name(vsnd->capture_test_mode),
+-                    vsnd->capture_test_after, vsnd->capture_test_count);
++                    vsnd->capture_test_after, vsnd->capture_test_count,
++                    vsnd->capture_test_initial_epoch,
++                    vsnd->capture_test_initial_frame,
++                    vsnd->capture_test_seed);
+     }
+     return valid;
+ }
+@@ -590,6 +650,13 @@
+         error_report("Number of channels is not supported.");
+         return cpu_to_le32(VIRTIO_SND_S_NOT_SUPP);
+     }
++    if (s->capture_test_mode == VIRTIO_SND_CAPTURE_TEST_SEQUENCE &&
++        (params->channels > 2 || params->format != VIRTIO_SND_PCM_FMT_S16 ||
++         params->rate != VIRTIO_SND_PCM_RATE_48000)) {
++        error_report("virtio-snd sequence test requires S16_LE 48 kHz and "
++                     "one or two channels");
++        return cpu_to_le32(VIRTIO_SND_S_NOT_SUPP);
++    }
+     if (params->format >= sizeof(supported_formats) * BITS_PER_BYTE ||
+         !(supported_formats & BIT(params->format))) {
+         error_report("Stream format is not supported.");
+@@ -909,6 +976,55 @@
+             queue_depth = virtio_snd_capture_test_queue_depth(stream);
+             stream->active = start;
+             active_after = stream->active;
++            if (start && !active_before &&
++                s->capture_test_mode == VIRTIO_SND_CAPTURE_TEST_SEQUENCE) {
++                stream->capture_sequence_byte_offset = 0;
++                stream->capture_sequence_failed = false;
++                if (!stream->capture_sequence_initialized) {
++                    stream->capture_sequence_epoch =
++                        s->capture_test_initial_epoch;
++                    stream->capture_sequence_next_frame =
++                        s->capture_test_initial_frame;
++                    stream->capture_sequence_initialized = true;
++                } else {
++                    stream->capture_sequence_epoch++;
++                }
++                stream->capture_sequence_first_frame =
++                    stream->capture_sequence_next_frame;
++                stream->capture_sequence_frames_epoch = 0;
++                stream->capture_sequence_descriptors_epoch = 0;
++                stream->capture_sequence_reported = false;
++            }
++            if (!start && active_before &&
++                s->capture_test_mode == VIRTIO_SND_CAPTURE_TEST_SEQUENCE) {
++                uint32_t trailing_bytes = stream->capture_sequence_byte_offset;
++
++                if (trailing_bytes) {
++                    stream->capture_sequence_next_frame++;
++                    stream->capture_sequence_byte_offset = 0;
++                }
++                info_report("VIRTIO_SND_SEQUENCE_STOP stream=%" PRIu32
++                            " epoch=%" PRIu64 " first_frame=%" PRIu64
++                            " next_frame=%" PRIu64 " frames=%" PRIu64
++                            " descriptors=%" PRIu32 " trailing_bytes=%" PRIu32
++                            " remaining=%" PRIu32 " failed=%d",
++                            stream_id, stream->capture_sequence_epoch,
++                            stream->capture_sequence_first_frame,
++                            stream->capture_sequence_next_frame,
++                            stream->capture_sequence_frames_epoch,
++                            stream->capture_sequence_descriptors_epoch,
++                            trailing_bytes, s->capture_test_remaining,
++                            stream->capture_sequence_failed);
++            }
++            if (start && !active_before &&
++                s->capture_test_mode == VIRTIO_SND_CAPTURE_TEST_SEQUENCE) {
++                info_report("VIRTIO_SND_SEQUENCE_START stream=%" PRIu32
++                            " epoch=%" PRIu64 " first_frame=%" PRIu64
++                            " channels=%u seed=0x%016" PRIx64,
++                            stream_id, stream->capture_sequence_epoch,
++                            stream->capture_sequence_first_frame,
++                            stream->as.nchannels, s->capture_test_seed);
++            }
+         }
+         if (!held_for_delay) {
+             if (stream->info.direction == VIRTIO_SND_D_OUTPUT) {
+@@ -1855,8 +1971,27 @@
+ static inline void return_rx_buffer(VirtIOSoundPCMStream *stream,
+                                     VirtIOSoundPCMBuffer *buffer)
+ {
++    VirtIOSound *vsnd = stream->s;
+     virtio_snd_pcm_status resp = { 0 };
+-    resp.status = cpu_to_le32(VIRTIO_SND_S_OK);
++    uint32_t status_code = VIRTIO_SND_S_OK;
++
++    if (vsnd->capture_test_mode == VIRTIO_SND_CAPTURE_TEST_SEQUENCE) {
++        if (stream->capture_sequence_failed ||
++            (buffer->size && !vsnd->capture_test_remaining)) {
++            status_code = VIRTIO_SND_S_BAD_MSG;
++            if (!stream->capture_sequence_failed) {
++                error_report("VIRTIO_SND_SEQUENCE_EXHAUSTED stream=%" PRIu32
++                             " epoch=%" PRIu64 " descriptors=%" PRIu32,
++                             stream->id, stream->capture_sequence_epoch,
++                             stream->capture_sequence_descriptors_epoch);
++                stream->capture_sequence_failed = true;
++            }
++        } else if (buffer->size) {
++            vsnd->capture_test_remaining--;
++            stream->capture_sequence_descriptors_epoch++;
++        }
++    }
++    resp.status = cpu_to_le32(status_code);
+     resp.latency_bytes = 0;
+     /* Copy data -if any- to guest */
+     iov_from_buf(buffer->elem->in_sg,
+@@ -1924,6 +2059,7 @@
+     VirtIOSound *vsnd = stream->s;
+ 
+     return vsnd->capture_test_mode != VIRTIO_SND_CAPTURE_TEST_NONE &&
++           vsnd->capture_test_mode != VIRTIO_SND_CAPTURE_TEST_SEQUENCE &&
+            vsnd->capture_test_remaining &&
+            vsnd->capture_test_seen >= vsnd->capture_test_after;
+ }
+@@ -1958,6 +2094,71 @@
+     }
+     vsnd->capture_test_control_trace_events++;
+     return true;
++}
++
++static uint16_t virtio_snd_capture_test_sequence_sample(uint64_t seed,
++                                                         uint64_t epoch,
++                                                         uint64_t frame,
++                                                         uint64_t channel)
++{
++    uint64_t x = seed ^ (epoch * VIRTIO_SND_SEQUENCE_EPOCH_MUL) ^
++                 (frame * VIRTIO_SND_SEQUENCE_FRAME_MUL) ^
++                 (channel * VIRTIO_SND_SEQUENCE_CHANNEL_MUL);
++
++    x ^= x >> 30;
++    x *= UINT64_C(0xbf58476d1ce4e5b9);
++    x ^= x >> 27;
++    x *= UINT64_C(0x94d049bb133111eb);
++    x ^= x >> 31;
++    return (uint16_t)(x >> 48);
++}
++
++static void virtio_snd_capture_test_sequence_feed(
++    VirtIOSoundPCMStream *stream, uint8_t *data, size_t size)
++{
++    VirtIOSound *vsnd = stream->s;
++    uint32_t frame_bytes = stream->as.nchannels * sizeof(uint16_t);
++    size_t i;
++
++    if (stream->as.fmt != AUDIO_FORMAT_S16 || stream->as.big_endian ||
++        stream->as.nchannels < 1 || stream->as.nchannels > 2 ||
++        !stream->capture_sequence_initialized ||
++        stream->capture_sequence_failed) {
++        stream->capture_sequence_failed = true;
++        error_report("VIRTIO_SND_SEQUENCE_INVALID stream=%" PRIu32
++                     " fmt=%u channels=%u initialized=%d",
++                     stream->id, stream->as.fmt, stream->as.nchannels,
++                     stream->capture_sequence_initialized);
++        return;
++    }
++
++    if (!stream->capture_sequence_reported) {
++        info_report("VIRTIO_SND_SEQUENCE_DATA stream=%" PRIu32
++                    " epoch=%" PRIu64 " first_frame=%" PRIu64
++                    " channels=%u seed=0x%016" PRIx64,
++                    stream->id, stream->capture_sequence_epoch,
++                    stream->capture_sequence_next_frame,
++                    stream->as.nchannels, vsnd->capture_test_seed);
++        stream->capture_sequence_reported = true;
++    }
++
++    for (i = 0; i < size; i++) {
++        uint32_t sample_byte = stream->capture_sequence_byte_offset %
++                               sizeof(uint16_t);
++        uint64_t channel = stream->capture_sequence_byte_offset /
++                           sizeof(uint16_t);
++        uint16_t sample = virtio_snd_capture_test_sequence_sample(
++            vsnd->capture_test_seed, stream->capture_sequence_epoch,
++            stream->capture_sequence_next_frame, channel);
++
++        data[i] = (sample >> (8 * sample_byte)) & 0xff;
++        stream->capture_sequence_byte_offset++;
++        if (stream->capture_sequence_byte_offset == frame_bytes) {
++            stream->capture_sequence_byte_offset = 0;
++            stream->capture_sequence_next_frame++;
++            stream->capture_sequence_frames_epoch++;
++        }
++    }
+ }
+ 
+ static bool virtio_snd_capture_test_reply(VirtIOSoundPCMStream *stream,
+@@ -1973,6 +2174,9 @@
+     uint32_t ordinal = vsnd->capture_test_count -
+                        vsnd->capture_test_remaining + 1;
+ 
++    if (vsnd->capture_test_mode == VIRTIO_SND_CAPTURE_TEST_SEQUENCE) {
++        return false;
++    }
+     if (input_size < sizeof(status)) {
+         error_report("virtio-snd capture-test: input SG smaller than status");
+         vsnd->capture_test_remaining = 0;
+@@ -2060,7 +2264,6 @@
+         vsnd->capture_test_remaining = 0;
+         return false;
+     }
+-
+     status.status = cpu_to_le32(status_code);
+     status.latency_bytes = 0;
+     status_offset = packed ? audio_bytes : capacity;
+@@ -2089,16 +2292,18 @@
+     QSIMPLEQ_REMOVE(&stream->queue, buffer, VirtIOSoundPCMBuffer, entry);
+     virtio_snd_pcm_buffer_free(buffer);
+     vsnd->capture_test_remaining--;
+-    info_report("virtio-snd capture-test reply: mode=%s stream=%" PRIu32
+-                " item=%" PRIu32 "/%" PRIu32 " after=%" PRIu32
+-                " seen=%" PRIu32 " audio=%zu used=%zu status=0x%08" PRIx32
+-                " remaining=%" PRIu32 " t_ms=%" PRIi64,
+-                virtio_snd_capture_test_mode_name(vsnd->capture_test_mode),
+-                stream->id, ordinal, vsnd->capture_test_count,
+-                vsnd->capture_test_after, vsnd->capture_test_seen,
+-                audio_bytes, used_len, status_code,
+-                vsnd->capture_test_remaining,
+-                qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
++    if (vsnd->capture_test_mode != VIRTIO_SND_CAPTURE_TEST_SEQUENCE) {
++        info_report("virtio-snd capture-test reply: mode=%s stream=%" PRIu32
++                    " item=%" PRIu32 "/%" PRIu32 " after=%" PRIu32
++                    " seen=%" PRIu32 " audio=%zu used=%zu status=0x%08" PRIx32
++                    " remaining=%" PRIu32 " t_ms=%" PRIi64,
++                    virtio_snd_capture_test_mode_name(vsnd->capture_test_mode),
++                    stream->id, ordinal, vsnd->capture_test_count,
++                    vsnd->capture_test_after, vsnd->capture_test_seen,
++                    audio_bytes, used_len, status_code,
++                    vsnd->capture_test_remaining,
++                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
++    }
+     return true;
+ }
+ 
+@@ -2292,6 +2497,18 @@
+                 continue;
+             }
+ 
++            if (vsnd->capture_test_mode == VIRTIO_SND_CAPTURE_TEST_SEQUENCE &&
++                !vsnd->capture_test_remaining) {
++                if (!stream->capture_sequence_failed) {
++                    error_report("VIRTIO_SND_SEQUENCE_EXHAUSTED stream=%" PRIu32
++                                 " epoch=%" PRIu64 " descriptors=%" PRIu32,
++                                 stream->id, stream->capture_sequence_epoch,
++                                 stream->capture_sequence_descriptors_epoch);
++                    stream->capture_sequence_failed = true;
++                }
++                return_rx_buffer(stream, buffer);
++                continue;
++            }
+             if (vsnd->capture_test_delay_ms &&
+                 !vsnd->capture_test_delay_started &&
+                 virtio_snd_capture_test_due(stream)) {
+@@ -2349,6 +2566,11 @@
+                                      stream->voice.in,
+                                      buffer->data + buffer->size,
+                                      to_read);
++                if (size && vsnd->capture_test_mode ==
++                            VIRTIO_SND_CAPTURE_TEST_SEQUENCE) {
++                    virtio_snd_capture_test_sequence_feed(
++                        stream, buffer->data + buffer->size, size);
++                }
+                 if (virtio_snd_capture_test_trace_allow(vsnd)) {
+                     info_report("virtio-snd capture-test trace: rx-read"
+                                 " t_ms=%" PRIi64 " request=%zu got=%zu"
+--- a/include/hw/audio/virtio-snd.h
++++ b/include/hw/audio/virtio-snd.h
+@@ -92,6 +92,7 @@
+     VIRTIO_SND_CAPTURE_TEST_USED_OVER,
+     VIRTIO_SND_CAPTURE_TEST_MISALIGNED,
+     VIRTIO_SND_CAPTURE_TEST_BAD_STATUS,
++    VIRTIO_SND_CAPTURE_TEST_SEQUENCE,
+ } VirtIOSoundCaptureTestMode;
+ 
+ /*
+@@ -164,6 +165,16 @@
+     QemuMutex queue_mutex;
+     bool active;
+     uint32_t latency_bytes;
++    /* Deterministic S16 capture-test sequence state. */
++    uint64_t capture_sequence_epoch;
++    uint64_t capture_sequence_first_frame;
++    uint64_t capture_sequence_next_frame;
++    uint64_t capture_sequence_frames_epoch;
++    uint32_t capture_sequence_descriptors_epoch;
++    uint32_t capture_sequence_byte_offset;
++    bool capture_sequence_initialized;
++    bool capture_sequence_reported;
++    bool capture_sequence_failed;
+     QSIMPLEQ_HEAD(, VirtIOSoundPCMBuffer) queue;
+ };
+ 
+@@ -242,6 +253,9 @@
+     uint32_t capture_test_count;
+     uint32_t capture_test_seen;
+     uint32_t capture_test_remaining;
++    uint64_t capture_test_seed;
++    uint64_t capture_test_initial_epoch;
++    uint64_t capture_test_initial_frame;
+     /* One-shot delayed short response state, guarded by capture_test_mutex. */
+     QemuMutex capture_test_mutex;
+     QEMUTimer *capture_test_delay_timer;

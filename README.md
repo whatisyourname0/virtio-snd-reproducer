@@ -3,6 +3,13 @@
 This package runs host-side ASan and UBSan regressions against source extracted from a Linux Git worktree.
 It contains five signed patches and the host test harnesses, but no kernel or QEMU build, audio samples, or private lab logs.
 
+## Staged capture follow-ups
+
+The [capture-followups package](capture-followups/README.md) contains the
+ACK-ordering and period-scheduling RFC reproducers, pinned prerequisites,
+QEMU/kernel build recipes and fresh-build regression results. Its source stack
+is separate from the original five-patch host suite documented below.
+
 ## Requirements
 
 - Python 3.10 or newer

@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "base": {
+    "repository": "https://git.kernel.org/pub/scm/linux/kernel/git/tiwai/sound.git",
+    "commit": "5618f6837ef3314e2c581d4c05ec13b7ed975cb4",
+    "core_already_in_base": [
+      "1f21537b11863e74d752cab3edbb78cc6efe92fc",
+      "d9f52113f263498f000cecce5c4a82b7d2abf9d2"
+    ]
+  },
+  "application_method": "In a disposable clean checkout at base.commit apply entries in order with git apply --index. This preserves patch bytes without creating commits or adding DCO tags.",
+  "ordered_patches": [
+    {
+      "order": 1,
+      "path": "provenance/patches/01-01-39fb327a004c966ab90f66a34a64bbdbb3ffb475.patch",
+      "sha256": "18ef9caa7ab928f727053e556641781c601e9e30461a3ed7b154e9fa35c0d32a",
+      "stable_patch_id": "39fb327a004c966ab90f66a34a64bbdbb3ffb475",
+      "apply": "git apply --index",
+      "role": "prerequisite"
+    },
+    {
+      "order": 2,
+      "path": "provenance/patches/02-02-7c6bc344656fd839ae0d697ba18d66ac0b47827a.patch",
+      "sha256": "078061dbf759a791abd8a2f3134484d57393e1ec5e564e395d14f207902e56f3",
+      "stable_patch_id": "7c6bc344656fd839ae0d697ba18d66ac0b47827a",
+      "apply": "git apply --index",
+      "role": "prerequisite"
+    },
+    {
+      "order": 3,
+      "path": "provenance/patches/03-03-9dd290ac3147fa7b49a475d7df8a6172778f2860.patch",
+      "sha256": "1744029d1d465880f84d35a528ec38d7e61ac4b15f94249ef4ccab393ffbe54e",
+      "stable_patch_id": "9dd290ac3147fa7b49a475d7df8a6172778f2860",
+      "apply": "git apply --index",
+      "role": "prerequisite"
+    },
+    {
+      "order": 4,
+      "path": "provenance/patches/04-04-f4c24a5e441343a690f4ac2437f181c815bc23d0.patch",
+      "sha256": "674d95a5dc6c787541b3ebc212cfe36e3c14fea46370eabb5250d062b2bc63ff",
+      "stable_patch_id": "f4c24a5e441343a690f4ac2437f181c815bc23d0",
+      "apply": "git apply --index",
+      "role": "prerequisite"
+    },
+    {
+      "order": 5,
+      "path": "provenance/patches/05-05-ab4a5b770247a65272ab7af18a75a147daf81287.patch",
+      "sha256": "a8bde75bdf79119620f16f0599b39c1e9e9bac7371be65d5e9ff709dc0ebc8f1",
+      "stable_patch_id": "ab4a5b770247a65272ab7af18a75a147daf81287",
+      "apply": "git apply --index",
+      "role": "prerequisite"
+    },
+    {
+      "order": 6,
+      "path": "provenance/patches/06-06-cfe3e7000e695a2fda27993f4d9acf0a637cf24e.patch",
+      "sha256": "8e49a1bf8f0eb429e0477f25a3117db6025bbe5449f5e38148aa904f9188f46b",
+      "stable_patch_id": "cfe3e7000e695a2fda27993f4d9acf0a637cf24e",
+      "apply": "git apply --index",
+      "role": "prerequisite"
+    },
+    {
+      "order": 7,
+      "path": "provenance/patches/07-0001-vz-capture.patch",
+      "sha256": "5809970b81bddbc4ede0de15d6c49e7a435099cc44e3252cf64b9de4274b7795",
+      "stable_patch_id": "771e8815f2b874d98376f309dc60bc90244f378c",
+      "apply": "git apply --index",
+      "role": "prerequisite"
+    },
+    {
+      "order": 8,
+      "path": "provenance/patches/08-0001-ALSA-virtio-account-staged-capture-reads-before-RX-r.patch",
+      "sha256": "c266608235e7ac061c583cf53a768f3f6f1e7d174d1cd28b8f2633831e98e4cf",
+      "stable_patch_id": "fdea8eaa29a47360e19820e27301dd8b6b26e43e",
+      "apply": "git apply --index",
+      "role": "ACK fix",
+      "local_commit": "ddde35102bf4588d9aa98a3fe5321509d19cb6bf"
+    },
+    {
+      "order": 9,
+      "path": "provenance/patches/09-0002-ALSA-virtio-prioritize-staged-capture-period-work.patch",
+      "sha256": "0b172808ec659348ebed86a8699a7e63f21f03a3918cd874db4f21edae7625f8",
+      "stable_patch_id": "67ffb5c72970e1aeace72b6537dab1b977a3fc6c",
+      "apply": "git apply --index",
+      "role": "period scheduling",
+      "local_commit": "8d0d4c1a6c4bcb81ae9f52d1c0d979fafb2e22f2"
+    }
+  ],
+  "stacks": {
+    "pre_ack": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "ack_only": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "ack_plus_highpri": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ]
+  },
+  "series": [
+    {
+      "role": "lifetime/error recovery v3",
+      "cover_message_id": "cover.1791881787.git.mynameisjune111@gmail.com",
+      "patch_orders": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    },
+    {
+      "role": "generic control wait RFC v2",
+      "cover_message_id": "rfc-v2-generic-control-wait-0.2eddd58a796e497f@gmail.com",
+      "patch_orders": [
+        6
+      ]
+    },
+    {
+      "role": "VZ capture RFC v2",
+      "patch_message_id": "rfc-v2-vz-capture-compat-1.b9ab4c1540dc4691@gmail.com",
+      "patch_orders": [
+        7
+      ]
+    },
+    {
+      "role": "ACK and scheduling RFC",
+      "cover_message_id": "rfc-virtio-snd-capture-followups-0.f2737c95c12e45b4@gmail.com",
+      "patch_orders": [
+        8,
+        9
+      ],
+      "delivery_status": "smtp_250_accepted",
+      "archive_status": "unverified: challenge or non-mail response in recorded check"
+    }
+  ],
+  "scope": "Historical tested stack, not a claim that prerequisites are merged or current upstream. No new signatures or submission."
+}
